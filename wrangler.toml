@@ -1,0 +1,10 @@
+name = "cf-ip-whitelist"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Your Cloudflare account ID (from Dashboard > right sidebar)
+account_id = "YOUR_ACCOUNT_ID"
+
+kv_namespaces = [
+  { binding = "DEVICE_IPS", id = "YOUR_KV_NAMESPACE_ID" }
+]
