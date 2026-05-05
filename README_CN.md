@@ -2,58 +2,56 @@
 
 [English](README.md)
 
-手机点一下，Cloudflare Access Policy 的 IP 白名单自动更新。不需要服务器，全跑在 Cloudflare 免费额度上。
+通过手机一键更新 Cloudflare Access Policy 的 IP 白名单。无需服务器，完全运行在 Cloudflare 免费额度上。
 
-## 这玩意解决什么问题？
+## 解决什么问题
 
-你用 Cloudflare Tunnel 把家里的服务穿透出去，这很好。但 Tunnel 本身不拦人——谁知道了你的域名，就能看见你的登录页。你当然加了 Access Policy 做 IP 白名单，只有你手机的 IP 能放行，别人连登录界面都看不到。
+如果你用 Cloudflare Tunnel 把家里服务穿透到公网，Tunnel 本身不做访问控制——任何人知道你的域名就能看到登录页面。加上 Access Policy IP 白名单后，只有你手机的 IP 能直接放行，其他人连登录界面都看不到。这才是真正的零信任：未经验证的请求，连入口都摸不到。
 
-**这才是真正的零信任：不认识你，连门都不让你看见。**
+问题在于手机 IP 会变。Wi-Fi 和蜂窝网络切换一次，出口 IP 就变了，你就会把自己锁在外面。每次手动去 Cloudflare 后台改白名单很麻烦。
 
-问题是，手机 IP 会变啊。切个 Wi-Fi、切回蜂窝、出趟门，IP 就变了，你就把自己锁外面了。每次还得打开 Cloudflare 后台手动改白名单。
+这个 Worker 就是解决这个的：手机点一下收藏的链接，白名单自动更新。
 
-这个 Worker 就是解决这个的：手机点一下收藏的链接，白名单自动更新。完事。
-
-## 怎么工作的
+## 工作流程
 
 ```
 手机打开刷新链接
         ↓
-Worker 拿到你的 IP（CF-Connecting-IP，真实出口 IP）
+Worker 获取 CF-Connecting-IP（你的真实出口 IP）
         ↓
-页面里 JS 用 ipify 测出 IPv4 和 IPv6
+页面内 JS 通过 ipify 探测 IPv4 和 IPv6
         ↓
-存进 KV（每个设备最多存 8 个，超了就踢掉最旧的）
+存储到 KV（每设备最多 8 个，超出时淘汰最旧的）
         ↓
-重建 Access Policy 的 include 列表 → 调 CF API 写进去
+重建 Access Policy 的 include 列表 → PUT CF API
         ↓
-大概 1 秒就生效了
+约 1 秒后 IP 在 Cloudflare 边缘节点生效
 ```
 
-## 特点
+## 功能
 
-- **双栈**：IPv4 和 IPv6 一起加，哪个都不断
-- **多设备**：你和家人各用各的链接，互不影响
-- **一键**：收藏链接点一下就行，不用进后台
-- **不乱堆积**：每个设备最多 8 个 IP，最旧的自动清掉
-- **零服务器**：全跑在 Cloudflare 上，NAS 上不装任何东西
+- **双栈**：自动检测并记录 IPv4 和 IPv6
+- **多设备**：每个设备独立管理白名单，可配置每设备上限
+- **一键更新**：收藏链接，IP 变化时点击即可
+- **自动清理**：达到上限时自动淘汰最旧 IP，不留冗余
+- **零依赖**：纯 Cloudflare Worker + KV，无需额外服务
 
 ## 快速开始
 
 ### 准备工作
 
-- 一个 Cloudflare 账号（免费版就行）
-- 装好 `wrangler` CLI（`npm install -g wrangler`，或者每次用 `npx wrangler` 也行）
-- 已经在 CF Zero Trust 里建好了 Access Policy（新建的话看 [官方文档](https://developers.cloudflare.com/cloudflare-one/policies/access/)）
+- Cloudflare 账户（免费版即可）
+- 安装了 `wrangler` CLI（`npm install -g wrangler`，也可使用 `npx wrangler`）
+- 已在 Cloudflare Zero Trust 中创建 Access Policy（如未创建，参考 [官方文档](https://developers.cloudflare.com/cloudflare-one/policies/access/)）
 
-### 1. 建 KV 命名空间
+### 1. 创建 KV 命名空间
 
 ```bash
 wrangler kv namespace create DEVICE_IPS
-# 把返回的 id 填到 wrangler.toml 里
+# 将返回的 id 填入 wrangler.toml
 ```
 
-### 2. 改配置
+### 2. 配置文件
 
 编辑 `wrangler.toml`：
 
@@ -68,36 +66,36 @@ kv_namespaces = [
 ]
 ```
 
-### 3. 设密钥
+### 3. 设置密钥
 
 ```bash
-# 这仨必须设
-wrangler secret put CF_API_TOKEN    # CF API Token，权限下面有说
+# 必须设置的
+wrangler secret put CF_API_TOKEN    # CF API Token，权限见下方说明
 wrangler secret put ACCOUNT_ID      # Cloudflare 账户 ID
 wrangler secret put POLICY_ID       # 要更新的 Access Policy ID
 
-# 设备密钥，每设备一个（用 openssl rand -hex 16 生成）
-wrangler secret put KEY_DEVICE_1    # 给第一个设备
-wrangler secret put KEY_DEVICE_2    # 给第二个设备
+# 设备密钥（每设备一个，使用 openssl rand -hex 16 生成）
+wrangler secret put KEY_DEVICE_1    # 第一个设备
+wrangler secret put KEY_DEVICE_2    # 第二个设备
 
-# 可选：固定要加到白名单里的 IP 段，逗号分割
-# wrangler secret put FIXED_IPS    # 比如 "203.0.113.0/24,198.51.100.0/24"
+# 可选：需要始终包含在白名单中的固定 IP 段（逗号分隔）
+# wrangler secret put FIXED_IPS    # 例如 "203.0.113.0/24,198.51.100.0/24"
 ```
 
 ### 4. 部署
 
 ```bash
 wrangler deploy
-# 会返回一个 URL，像这样：https://cf-ip-whitelist.你的子域名.workers.dev
+# 运行后会返回 URL，格式为：https://cf-ip-whitelist.你的子域名.workers.dev
 ```
 
-### 5. 绑一个自己的域名（强烈建议）
+### 5. 绑定自定义域名（推荐）
 
-`workers.dev` 在国内打不开。去 Cloudflare Dashboard → Workers → 你的 Worker → 设置 → 域名和路由 → 添加自定义域名。
+`workers.dev` 在部分地区无法访问。在 Cloudflare Dashboard → Workers → 你的 Worker → 设置 → 域名和路由 → 添加自定义域名。
 
-### 6. 给 Worker 域名开 Bypass
+### 6. 为 Worker 域名设置 Access 放行
 
-你的 Access Policy 会拦截一切，包括 Worker 自己。给 Worker 的域名建一条放行规则：
+Access Policy 可能会拦截 Worker 自身的请求。为 Worker 域名创建一条 Bypass 策略：
 
 ```
 Cloudflare Zero Trust → Access → 应用程序 → 添加
@@ -105,40 +103,40 @@ Cloudflare Zero Trust → Access → 应用程序 → 添加
   - 策略：Bypass（所有人）
 ```
 
-### 7. 试试能不能用
+### 7. 测试
 
 ```
-# 手机浏览器打开：
+# 从手机浏览器访问：
 https://your-worker.example.com/?key=你的设备密钥&action=sync
 ```
 
-## API
+## API 接口
 
-| 接口 | 干什么的 |
+| 接口 | 说明 |
 |---|---|
-| `GET /?key=KEY&action=sync` | 记下连接 IP，返回一个页面自动测出双栈 |
-| `GET /?key=KEY&action=add&ip=X.X.X.X` | 手动加一个 IP（返回 JSON） |
-| `GET /?key=KEY&action=list` | 查看当前设备所有白名单 IP（JSON） |
-| `GET /?key=KEY&action=remove&ip=X.X.X.X` | 删掉某个 IP |
+| `GET /?key=KEY&action=sync` | 记录连接 IP 并返回自动探测双栈的 HTML 页面 |
+| `GET /?key=KEY&action=add&ip=X.X.X.X` | 添加指定 IP（返回 JSON） |
+| `GET /?key=KEY&action=list` | 列出当前设备所有白名单 IP（JSON） |
+| `GET /?key=KEY&action=remove&ip=X.X.X.X` | 移除指定 IP |
 
-## 手机上怎么用
+## 手机端配置
 
 ### iOS（快捷指令 + Scriptable）
 
-1. 装 [Scriptable](https://apps.apple.com/app/scriptable/id1405459188)（免费）
-2. 新建脚本，贴上下面这段
-3. 在快捷指令 App 里建两个自动化：
+1. 安装 [Scriptable](https://apps.apple.com/app/scriptable/id1405459188)（免费）
+2. 创建新脚本，粘贴下方代码
+3. 在快捷指令 App 中创建两个自动化：
    - **加入 Wi-Fi** → 运行 Scriptable 脚本
    - **离开 Wi-Fi** → 运行 Scriptable 脚本
 
 **同步脚本**：
 
 ```javascript
-// 改成你自己的
+// 替换为你的配置
 const WORKER_URL = "https://your-worker.example.com";
 const DEVICE_KEY = "你的设备密钥";
 
-// 判断是手动点还是自动触发
+// 判断是手动触发还是自动化触发
 const isManual = !args.shortcutParameter;
 
 async function callWorker(action, params) {
@@ -160,12 +158,12 @@ async function httpGet(url) {
 function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 if (isManual) {
-  // 手动点：打开页面看结果
+  // 手动触发：在 WebView 中打开同步页面
   const wv = WebView.current();
   await wv.loadURL(WORKER_URL + "/?key=" + DEVICE_KEY + "&action=sync");
   await wv.present();
 } else {
-  // 自动触发：后台更新
+  // 自动触发：等待网络稳定后后台更新
   await delay(5000);
 
   const [v4, v6] = await Promise.all([
@@ -193,16 +191,16 @@ if (isManual) {
 
 ### Android（HTTP Shortcuts）
 
-1. 装 [HTTP Shortcuts](https://play.google.com/store/apps/details?id=ch.rmy.android.http_shortcuts)（免费）
-2. 建一个"基本请求"，方法 `GET`，URL 填：
+1. 安装 [HTTP Shortcuts](https://play.google.com/store/apps/details?id=ch.rmy.android.http_shortcuts)（免费）
+2. 创建"基本请求"快捷方式，方法选择 `GET`，URL 填写：
    ```
    https://your-worker.example.com/?key=你的设备密钥&action=sync
    ```
-3. 把上面那个收藏到桌面，IP 变了点一下就行
+3. 将此快捷方式收藏到桌面，IP 变化时点击运行即可
 
-## Cloudflare API Token 权限
+## Cloudflare API Token
 
-去 https://dash.cloudflare.com/profile/api-tokens ，创建自定义 Token：
+在 https://dash.cloudflare.com/profile/api-tokens 创建自定义 Token：
 
 | 权限 | 访问级别 |
 |---|---|
@@ -211,22 +209,22 @@ if (isManual) {
 | Account > KV Storage | Edit |
 | Account > Account Settings | Read |
 
-作用域选你的账户就行。
+作用域选择你的账户。
 
 ## 高级配置
 
 ### 固定 IP 段
 
-如果你有固定的 IP（比如公司的公网出口），可以设成环境变量，这些 IP 会一直挂在白名单里：
+如果你有固定的 IP（如公司公网出口），可通过环境变量设置，这些 IP 将始终保留在白名单中：
 
 ```bash
 wrangler secret put FIXED_IPS
 # 输入：203.0.113.0/24,198.51.100.0/24
 ```
 
-### 加设备
+### 添加更多设备
 
-编辑 `src/index.js`，找到 `validateKey()`，加一行：
+编辑 `src/index.js`，在 `validateKey()` 中添加条目：
 
 ```javascript
 function validateKey(key, env) {
@@ -239,121 +237,120 @@ function validateKey(key, env) {
 }
 ```
 
-然后设密钥：
+然后设置对应的密钥：
 
 ```bash
 wrangler secret put KEY_LAPTOP
-# 填你给这台设备生成的随机字符串
 ```
 
-### 每设备最多存几个 IP
+### 每设备 IP 存储上限
 
-改 `src/index.js` 里的 `MAX_IPS_PER_DEVICE`（默认 8）。
+修改 `src/index.js` 中的 `MAX_IPS_PER_DEVICE`（默认：8）。
 
-## 更新和调试
+## 更新与调试
 
-改完代码重新部署：
+修改代码后重新部署：
 
 ```bash
 wrangler deploy
 ```
 
-想看实时日志：
+查看实时日志：
 
 ```bash
 wrangler tail
 ```
 
-用 API 查某设备当前有哪些 IP：
+通过 API 查询某设备当前的白名单状态：
 
 ```bash
 curl "https://your-worker.example.com/?key=你的设备密钥&action=list"
 ```
 
-## 重点：绕过 Cloudflare 人机验证
+## 重要：绕过 Cloudflare 人机验证
 
-你的 Worker 域名和 App 直连域名都在 Cloudflare 后面，可能会碰到一个问题：Cloudflare 的安全级别会触发人机验证（Managed Challenge），把你的刷新页面和手机 App 都卡死。
+如果你的 Worker URL 或服务域名通过 Cloudflare 代理，可能会遇到一个常见问题：Cloudflare 的安全级别触发了 Managed Challenge（人机验证），导致 IP 刷新页面和手机 App 都无法正常访问。
 
-### 什么情况
+### 问题原因
 
-Cloudflare 偶尔会根据 IP 信誉弹一个验证页面。这时候：
+Cloudflare 的安全级别会根据 IP 信誉触发验证页面。当触发时：
 
-1. **Worker 刷新页面** → 一打开就是 CF 的人机验证，看不到白名单更新界面
-2. **手机 App**（Home Assistant 之类）→ App 访问你的服务，CF 返回一个人机验证页面，App 不是浏览器，根本不知道怎么处理，直接报错
+1. **Worker IP 刷新页面** → 浏览器显示 Cloudflare 验证页面而非自动探测界面
+2. **手机 App**（Home Assistant 等）→ App 访问服务时，CF 返回 HTML 验证页面，App 内嵌浏览器无法处理 → 连接失败
 
-CF 官方文档写了：*"Cloudflare challenges are generally not supported in embedded browsers"* —— App 用的就是内嵌浏览器，不支持。
+Cloudflare 官方文档明确说明：*"Cloudflare challenges are generally not supported in embedded browsers"*——App 使用的正是内嵌浏览器。
 
-### 怎么修
+### 解决方案：配置规则
 
-建一条 Configuration Rule，把这几个域名的安全级别关了就行。
+创建 Cloudflare Configuration Rule，对相关域名关闭安全级别和浏览器完整性检查。
 
-**路径**：`Cloudflare Dashboard → 你的域名 → 规则 → 配置规则 → 创建规则`
+**控制台路径**：`Cloudflare Dashboard → 你的域名 → 规则 → 配置规则 → 创建规则`
 
 **规则设置**：
 
-- **名称**：随便写，比如 `关闭人机验证`
-- **匹配**：主机名等于以下之一：
+- **规则名称**：`App 域名绕过验证`
+- **匹配条件**：主机名属于以下之一：
   ```
-  your-worker.example.com    # Worker 域名
-  ha.example.com             # Home Assistant
-  app.example.com            # 其他 App
+  your-worker.example.com    # Worker IP 刷新页面
+  ha.example.com             # Home Assistant 直连
+  app.example.com            # 其他 App 直连域名
   ```
 - **设置**：
   - 安全级别 → **关闭**
   - 浏览器完整性检查 → **关闭**
 
-**表达式**：
+**表达式预览**：
 
 ```
 (http.host in {"your-worker.example.com" "ha.example.com" "app.example.com"})
 ```
 
-### 关了安全吗？
+### 安全影响分析
 
-| 防护层 | 受影响吗 | 原因 |
+| 防护层 | 是否受影响 | 原因 |
 |---|---|---|
-| DDoS 防护 | 不影响 | 独立规则集管着 |
-| WAF 托管规则 | 不影响 | 独立跑 |
-| Bot Fight Mode | 不影响 | 独立产品 |
-| 地理封锁 | 不影响 | 你设的封锁规则照旧 |
-| Access Policy | 不影响 | IP 白名单照样在边缘执行 |
-| 威胁评分 | 不用管了 | CF 自己已经废弃了这个机制（始终返回 0） |
+| DDoS 防护 | 否 | 独立托管规则集 |
+| WAF 托管规则 | 否 | 独立运行 |
+| Bot Fight Mode | 否 | 独立产品 |
+| 地理封锁 | 否 | 自定义封锁规则不受影响 |
+| Access Policy | 否 | IP 白名单仍在边缘节点执行 |
+| 威胁评分 | 不适用 | CF 已废弃此机制（始终返回 0） |
 
-关掉的只是 IP 信誉质询——一个 CF 自己都不再维护的老机制。其它防护全在。
+关闭的仅是 IP 信誉质询——一个 CF 已不再维护的旧机制。所有其他防护层保持活跃。
 
-### 哪些域名需要加进去
+### 需要加入的域名
 
-| 域名 | 为什么 |
+| 域名 | 原因 |
 |---|---|
-| Worker 域名 | 让刷新页面正常打开 |
-| App 直连域名 | App 里的请求才能过 |
-| **不要加** 纯浏览器访问的管理域名 | 留着验证也可以 |
+| Worker 域名 | 确保 IP 刷新页面正常加载 |
+| App 直连域名 | 确保 App 请求能通过（App 无法完成验证） |
+| **不要加入** 仅浏览器访问的管理域名 | 可按需保留这些域名的验证保护 |
 
 ## 故障排除
 
-| 问题 | 怎么搞 |
+| 问题 | 解决方法 |
 |---|---|
-| `workers.dev` 打不开 | 国内被墙了，绑自己的域名 |
-| Access Policy 把 Worker 拦了 | 给 Worker 域名建 Bypass 策略 |
-| 打开不是刷新页面，是 CF 人机验证 | 建一条 Configuration Rule 关掉安全级别，看上面那节 |
-| App 连不上，报错 | 一样，把你 App 的域名也加进 Configuration Rule |
-| `unknown rule type: 'description'` | Access Policy 的 include 里别加多余字段，只放 IP |
-| 中文乱码 | 代码已经修了，`charset=utf-8` 写死在返回头里 |
-| 测不出 IPv6 | 你当前网络可能没有 IPv6，只加 IPv4 也能用 |
+| `workers.dev` 无法访问 | 部分地区被屏蔽，添加自定义域名 |
+| Access Policy 拦截了 Worker | 为 Worker 域名创建 Bypass 策略 |
+| 打开后显示 CF 验证页面而非刷新界面 | 创建 Configuration Rule 关闭该域名的安全级别，详见上方章节 |
+| App 连接报错 | 同上，将 App 对应的域名也加入 Configuration Rule |
+| `unknown rule type: 'description'` 错误 | Access Policy 的 include 条目中不要添加额外字段 |
+| 浏览器中中文显示乱码 | 已修复，响应头中包含 `charset=utf-8` |
+| 无法检测到 IPv6 | 当前网络可能不支持 IPv6，仅 IPv4 也能正常使用 |
 
-## 安全相关
+## 安全说明
 
-- 设备密钥存的是 Worker Secrets，代码里都看不到，不会泄露
-- 每个设备单独存自己的 IP 列表
-- IP 带时间戳，最旧的自动清掉
-- Worker 只能读写你指定的那一条 Access Policy
-- 建议隔一段时间换一次设备密钥
+- 设备密钥存储为 Worker Secrets，不会暴露给客户端
+- 每个设备密钥映射到 KV 中唯一的设备名
+- IP 带时间戳存储，最旧的条目自动淘汰
+- Worker 仅有权限读写指定的 Access Policy
+- 建议定期轮换设备密钥
 
 ## 限制
 
-- 一个 Worker 对应一条 Access Policy，多条 Policy 就多部署几个
+- 一个 Worker 部署对应一条 Access Policy，多条 Policy 需要多个 Worker
 - CF Access include 数组上限：每条 Policy 1,000 个条目
-- KV 最终一致性大概 60 秒（实际用起来基本就是即时的）
+- KV 最终一致性约 60 秒（实际使用基本瞬时生效）
 
 ## 许可证
 
