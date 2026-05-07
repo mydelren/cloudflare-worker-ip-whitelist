@@ -260,11 +260,18 @@ function getFixedEntries(env) {
     .split(",")
     .map((ip) => ip.trim())
     .filter(Boolean)
+    .map(normalizeAccessIp)
+    .filter(Boolean)
     .map((ip) => ({ ip: { ip } }));
 }
 
 async function syncPolicy(env) {
-  const include = [...getFixedEntries(env)];
+  const include = [];
+  const seen = new Set();
+
+  for (const entry of getFixedEntries(env)) {
+    addIncludeEntry(include, seen, entry.ip.ip);
+  }
 
   const list = await env.DEVICE_IPS.list({ prefix: "device:" });
   for (const kvKey of list.keys) {
@@ -272,10 +279,8 @@ async function syncPolicy(env) {
     if (!Array.isArray(raw)) continue;
 
     for (const entry of raw) {
-      const isV6 = entry.ip.includes(":");
-      include.push({
-        ip: { ip: isV6 ? entry.ip + "/128" : entry.ip + "/32" },
-      });
+      const normalized = normalizeAccessIp(entry.ip);
+      if (normalized) addIncludeEntry(include, seen, normalized);
     }
   }
 
@@ -293,6 +298,52 @@ async function syncPolicy(env) {
 }
 
 // ==================== Utilities ====================
+
+function addIncludeEntry(include, seen, ip) {
+  if (seen.has(ip)) return;
+  seen.add(ip);
+  include.push({ ip: { ip } });
+}
+
+function normalizeAccessIp(value) {
+  if (typeof value !== "string") return null;
+  const ip = value.trim();
+  if (!ip) return null;
+
+  if (ip.includes("/")) {
+    const [addr, prefix, extra] = ip.split("/");
+    if (extra || !prefix) return null;
+    if (isIPv4(addr)) {
+      const n = Number(prefix);
+      return Number.isInteger(n) && n >= 0 && n <= 32 ? ip : null;
+    }
+    if (isIPv6(addr)) {
+      const n = Number(prefix);
+      return Number.isInteger(n) && n >= 0 && n <= 128 ? ip : null;
+    }
+    return null;
+  }
+
+  if (isIPv4(ip)) return ip + "/32";
+  if (isIPv6(ip)) return ip + "/128";
+  return null;
+}
+
+function isIPv4(value) {
+  const parts = value.split(".");
+  if (parts.length !== 4) return false;
+  return parts.every((part) => {
+    if (!/^\d+$/.test(part)) return false;
+    if (part.length > 1 && part.startsWith("0")) return false;
+    const n = Number(part);
+    return n >= 0 && n <= 255;
+  });
+}
+
+function isIPv6(value) {
+  if (!value.includes(":")) return false;
+  return /^[0-9a-fA-F:.]+$/.test(value) && value.split(":").length >= 3;
+}
 
 async function registerDevice(device, env) {
   const raw = await env.DEVICE_IPS.get(DEVICE_KEYS_MAP_KEY, "json");

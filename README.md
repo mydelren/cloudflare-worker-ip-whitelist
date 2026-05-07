@@ -2,11 +2,11 @@
 
 [中文文档](README_CN.md)
 
-Auto-update [Cloudflare Access Policy](https://developers.cloudflare.com/cloudflare-one/policies/access/) IP whitelists from mobile devices. Zero server required — runs entirely on Cloudflare's free tier.
+Auto-update [Cloudflare Access Policy](https://developers.cloudflare.com/cloudflare-one/policies/access/) IP whitelists from a private link on any device. Zero server required — runs entirely on Cloudflare's free tier.
 
 ## Why?
 
-Cloudflare Access is great for securing self-hosted services, but IP whitelisting becomes annoying when your phone's IP changes constantly (Wi-Fi ↔ cellular, roaming). This Worker lets you update your Access Policy with one click from your phone.
+Cloudflare Access is great for securing self-hosted services, but IP whitelisting becomes annoying when your phone's IP changes constantly (Wi-Fi ↔ cellular, roaming). This Worker lets you update your Access Policy with one click from a private bookmark or direct link.
 
 **Use case**: You have a Cloudflare Tunnel exposing your homelab services and use Access Policy IP whitelisting as your first line of defense.
 
@@ -108,6 +108,14 @@ Cloudflare Zero Trust → Access → Applications → Add
 https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync
 ```
 
+### Important: Treat the Link Like a Secret
+
+The `key` in the URL is a bearer-style secret. Keep the bookmark private and do not paste it into chat, public notes, shared documents, browser sync on shared machines, or screenshots.
+
+### Important: Use a Dedicated Access Policy
+
+This Worker updates one simple reusable Access Policy. Create a dedicated policy for it and do not point it at a complex policy with extra approval, MFA, or connection rules.
+
 ## API
 
 | Endpoint | Description |
@@ -119,13 +127,17 @@ https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync
 
 ## Phone Setup
 
+The main workflow is still the bookmark/direct-link above. The optional automation below only helps when you want a more hands-off trigger.
+
 ### iOS (Shortcuts + Scriptable)
 
 1. Install [Scriptable](https://apps.apple.com/app/scriptable/id1405459188) (free)
 2. Create a new Script, paste the sync script (see below)
-3. Create Shortcuts Automations:
+3. Create Shortcuts Automations if you want auto-run:
    - **Wi-Fi is Connected** → Run Scriptable
    - **Wi-Fi is Disconnected** → Run Scriptable
+
+You can also skip automation entirely and just keep the link in a private bookmark.
 
 **Sync Script** (for Scriptable):
 
@@ -141,15 +153,16 @@ async function callWorker(action, params) {
   let url = WORKER_URL + "/?key=" + DEVICE_KEY + "&action=" + action;
   if (params) url += "&" + params;
   try {
-    const r = await request({ url: url });
-    return JSON.parse(r.responseText);
+    const r = new Request(url);
+    const text = await r.loadString();
+    return JSON.parse(text);
   } catch(e) { return { error: e.message }; }
 }
 
 async function httpGet(url) {
   try {
-    const r = await request({ url: url });
-    return r.responseText.trim();
+    const r = new Request(url);
+    return (await r.loadString()).trim();
   } catch(e) { return null; }
 }
 
@@ -157,7 +170,7 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 if (isManual) {
   // Manual: open in WebView (sync page auto-detects dual-stack)
-  const wv = WebView.current();
+  const wv = new WebView();
   await wv.loadURL(WORKER_URL + "/?key=" + DEVICE_KEY + "&action=sync");
   await wv.present();
 } else {
@@ -185,7 +198,10 @@ if (isManual) {
   }
 
   result += added > 0 ? added + " IP(s) added" : "No new IPs";
-  Notification.ready().title("IP Whitelist").body(result).schedule();
+  const n = new Notification();
+  n.title = "IP Whitelist";
+  n.body = result;
+  await n.schedule();
 }
 ```
 
@@ -195,9 +211,7 @@ if (isManual) {
 2. Create a "Basic Request" shortcut:
    - Method: `GET`
    - URL: `https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync`
-3. Create a second shortcut for IPv4:
-   - URL: `https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=add&ip=${dynamic_value}`
-   - Use the app's dynamic IP variable feature
+3. Optionally create extra shortcuts for `add`, `list`, or `remove` if you want manual control beyond the main sync link.
 
 ## Cloudflare API Token
 
@@ -344,9 +358,11 @@ The only thing you're disabling is the IP reputation challenge, which CF itself 
 ## Security Notes
 
 - Device keys are stored as Worker Secrets (never exposed to clients)
+- The `key` appears in the URL, so keep the link private even though the secret itself lives in Worker Secrets
 - Each device key maps to a unique device name in KV
 - IPs are stored with timestamps, oldest auto-evicted
 - The Worker only has permission to read/write the specific Access Policy
+- The Access Policy should be dedicated to this Worker and kept simple
 - Consider rotating device keys periodically
 
 ## Limitations

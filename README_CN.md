@@ -2,7 +2,7 @@
 
 [English](README.md)
 
-通过手机一键更新 Cloudflare Access Policy 的 IP 白名单。无需服务器，完全运行在 Cloudflare 免费额度上。
+通过一个私密链接，一键更新 Cloudflare Access Policy 的 IP 白名单。无需服务器，完全运行在 Cloudflare 免费额度上。
 
 ## 解决什么问题
 
@@ -10,7 +10,7 @@
 
 问题在于手机 IP 会变。Wi-Fi 和蜂窝网络切换一次，出口 IP 就变了，你就会把自己锁在外面。每次手动去 Cloudflare 后台改白名单很麻烦。
 
-这个 Worker 就是解决这个的：手机点一下收藏的链接，白名单自动更新。
+这个 Worker 就是解决这个的：手机或电脑点一下收藏的私密链接，白名单自动更新。
 
 ## 工作流程
 
@@ -110,6 +110,14 @@ Cloudflare Zero Trust → Access → 应用程序 → 添加
 https://your-worker.example.com/?key=你的设备密钥&action=sync
 ```
 
+### 重要：这个链接就是密钥
+
+URL 里的 `key` 等同于一个 bearer token。请把它当作密码保管，不要发到聊天记录、公开笔记、共享文档、公共截图里，也不要在多人共用设备上同步这个书签。
+
+### 重要：请使用专用 Access Policy
+
+这个 Worker 会更新一条简单的 reusable Access Policy。建议单独创建一条专用策略给它使用，不要指向带有审批、MFA、连接规则等高级配置的复杂策略。
+
 ## API 接口
 
 | 接口 | 说明 |
@@ -119,15 +127,19 @@ https://your-worker.example.com/?key=你的设备密钥&action=sync
 | `GET /?key=KEY&action=list` | 列出当前设备所有白名单 IP（JSON） |
 | `GET /?key=KEY&action=remove&ip=X.X.X.X` | 移除指定 IP |
 
-## 手机端配置
+## 手机端使用方式
+
+最基础、最推荐的用法就是上面的收藏链接。下面的快捷指令和 HTTP Shortcuts 只是可选自动化，不是必须步骤。
 
 ### iOS（快捷指令 + Scriptable）
 
 1. 安装 [Scriptable](https://apps.apple.com/app/scriptable/id1405459188)（免费）
 2. 创建新脚本，粘贴下方代码
-3. 在快捷指令 App 中创建两个自动化：
+3. 如果想自动运行，可在快捷指令 App 中创建自动化：
    - **加入 Wi-Fi** → 运行 Scriptable 脚本
    - **离开 Wi-Fi** → 运行 Scriptable 脚本
+
+如果不想折腾自动化，直接收藏同步链接即可。
 
 **同步脚本**：
 
@@ -143,15 +155,16 @@ async function callWorker(action, params) {
   let url = WORKER_URL + "/?key=" + DEVICE_KEY + "&action=" + action;
   if (params) url += "&" + params;
   try {
-    const r = await request({ url: url });
-    return JSON.parse(r.responseText);
+    const r = new Request(url);
+    const text = await r.loadString();
+    return JSON.parse(text);
   } catch(e) { return { error: e.message }; }
 }
 
 async function httpGet(url) {
   try {
-    const r = await request({ url: url });
-    return r.responseText.trim();
+    const r = new Request(url);
+    return (await r.loadString()).trim();
   } catch(e) { return null; }
 }
 
@@ -159,7 +172,7 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 if (isManual) {
   // 手动触发：在 WebView 中打开同步页面
-  const wv = WebView.current();
+  const wv = new WebView();
   await wv.loadURL(WORKER_URL + "/?key=" + DEVICE_KEY + "&action=sync");
   await wv.present();
 } else {
@@ -185,7 +198,10 @@ if (isManual) {
   }
 
   result += added > 0 ? "新增 " + added + " 个 IP" : "无新增 IP";
-  Notification.ready().title("IP 白名单").body(result).schedule();
+  const n = new Notification();
+  n.title = "IP 白名单";
+  n.body = result;
+  await n.schedule();
 }
 ```
 
@@ -196,7 +212,7 @@ if (isManual) {
    ```
    https://your-worker.example.com/?key=你的设备密钥&action=sync
    ```
-3. 将此快捷方式收藏到桌面，IP 变化时点击运行即可
+3. 将此快捷方式收藏到桌面，IP 变化时点击运行即可。也可以继续只用浏览器书签。
 
 ## Cloudflare API Token
 
@@ -341,9 +357,11 @@ Cloudflare 官方文档明确说明：*"Cloudflare challenges are generally not 
 ## 安全说明
 
 - 设备密钥存储为 Worker Secrets，不会暴露给客户端
+- `key` 会出现在 URL 里，所以同步链接本身必须保密
 - 每个设备密钥映射到 KV 中唯一的设备名
 - IP 带时间戳存储，最旧的条目自动淘汰
 - Worker 仅有权限读写指定的 Access Policy
+- 建议使用专用、简单的 Access Policy，不要和复杂策略混用
 - 建议定期轮换设备密钥
 
 ## 限制
