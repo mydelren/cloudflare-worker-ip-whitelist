@@ -39,59 +39,66 @@ IPs whitelisted at Cloudflare edge in ~1 second
 ### Prerequisites
 
 - Cloudflare account (free tier works)
-- `wrangler` CLI installed (`npm install -g wrangler`)
 - A Cloudflare Access Policy already created (see [CF docs](https://developers.cloudflare.com/cloudflare-one/policies/access/) if you need to create one)
 
-### 1. Create KV Namespace
+---
 
-```bash
-wrangler kv namespace create DEVICE_IPS
-# Copy the id to wrangler.toml
-```
+### Option A: Deploy via Dashboard (recommended — no CLI needed)
 
-### 2. Configure
+All steps are done in the browser. No need to install Node.js or wrangler.
 
-Edit `wrangler.toml`:
+#### 1. Create a Worker
 
-```toml
-name = "cf-ip-whitelist"
-main = "src/index.js"
-compatibility_date = "2024-01-01"
-account_id = "YOUR_ACCOUNT_ID"
+1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages**
+2. Click **Create application**
+3. Choose **Create Worker**
+4. Give it a name (e.g. `cf-ip-whitelist`)
+5. Replace the default code with the contents of [`src/index.js`](src/index.js)
+6. Click **Deploy**
 
-kv_namespaces = [
-  { binding = "DEVICE_IPS", id = "YOUR_KV_NAMESPACE_ID" }
-]
-```
+#### 2. Create a KV Namespace
 
-### 3. Set Secrets
+1. In the Dashboard, go to **Workers & Pages** → **KV**
+2. Click **Create a namespace**
+3. Name it `DEVICE_IPS`
+4. Save
 
-```bash
-# Required
-wrangler secret put CF_API_TOKEN    # CF API token with Access: Apps and Policies Edit
-wrangler secret put ACCOUNT_ID      # Your Cloudflare account ID
-wrangler secret put POLICY_ID       # Access Policy ID to update
+#### 3. Bind KV to Your Worker
 
-# Device keys (one per device, generate with: openssl rand -hex 16)
-wrangler secret put KEY_DEVICE_1    # First device key
-wrangler secret put KEY_DEVICE_2    # Second device key
+1. Go back to your Worker → **Settings** → **Variables**
+2. Under **KV namespace bindings**, click **Add binding**
+3. Set:
+   - Variable name: `DEVICE_IPS`
+   - KV namespace: select the `DEVICE_IPS` namespace you just created
+4. Click **Deploy** to save
 
-# Optional: fixed IP ranges (comma-separated CIDRs)
-# wrangler secret put FIXED_IPS    # e.g. "203.0.113.0/24,198.51.100.0/24"
-```
+#### 4. Set Environment Variables
 
-### 4. Deploy
+Still in your Worker → **Settings** → **Variables** → **Environment variables**, add these:
 
-```bash
-wrangler deploy
-# Note the URL: https://cf-ip-whitelist.YOUR_SUBDOMAIN.workers.dev
-```
+| Variable | Value | Example |
+|---|---|---|
+| `CF_API_TOKEN` | Your Cloudflare API token | `cfut_...` |
+| `ACCOUNT_ID` | Your Cloudflare account ID | `d20a6...` |
+| `POLICY_ID` | The Access Policy ID to update | `5800b1...` |
+| `KEY_DEVICE_1` | Random secret for device 1 | `bd6ec9...` |
+| `KEY_DEVICE_2` | Random secret for device 2 | `8291e7...` |
+| `FIXED_IPS` | *(Optional)* Fixed CIDRs | `203.0.113.0/24` |
 
-### 5. Add Custom Domain (recommended)
+Generate device keys with any random string (e.g. from [uuidgenerator.net](https://www.uuidgenerator.net/)).
 
-`workers.dev` is blocked in some regions. Add a custom domain via Cloudflare Dashboard → Workers → your worker → Settings → Domains & Routes → Add.
+Click **Deploy** after adding all variables.
 
-### 6. Set Up Access Bypass for Worker
+#### 5. Add a Custom Domain
+
+`workers.dev` is blocked in some regions. Add your own domain:
+
+1. Worker → **Settings** → **Triggers** → **Custom Domains**
+2. Click **Add Custom Domain**
+3. Enter a subdomain you control (e.g. `wl.example.com`)
+4. Save
+
+#### 6. Set Up Access Bypass for the Worker
 
 Your Access Policy might block the Worker itself. Create a Bypass policy for the Worker's hostname:
 
@@ -101,12 +108,17 @@ Cloudflare Zero Trust → Access → Applications → Add
   - Policy: Bypass ( Everyone )
 ```
 
-### 7. Test
+#### 7. Test
+
+Open this URL on your phone:
 
 ```
-# From your phone's browser:
 https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync
 ```
+
+You should see a page showing your IP and a confirmation that it was added.
+
+---
 
 ### Important: Treat the Link Like a Secret
 
@@ -115,6 +127,38 @@ The `key` in the URL is a bearer-style secret. Keep the bookmark private and do 
 ### Important: Use a Dedicated Access Policy
 
 This Worker updates one simple reusable Access Policy. Create a dedicated policy for it and do not point it at a complex policy with extra approval, MFA, or connection rules.
+
+---
+
+### Option B: Deploy with wrangler (for developers)
+
+If you prefer the CLI or need to manage the project in Git:
+
+```bash
+# 1. Install wrangler
+npm install -g wrangler
+
+# 2. Log in
+wrangler login
+
+# 3. Create KV namespace
+wrangler kv namespace create DEVICE_IPS
+# Copy the returned id into wrangler.toml
+
+# 4. Edit wrangler.toml with your account_id and kv_namespace id
+
+# 5. Set secrets
+wrangler secret put CF_API_TOKEN
+wrangler secret put ACCOUNT_ID
+wrangler secret put POLICY_ID
+wrangler secret put KEY_DEVICE_1
+wrangler secret put KEY_DEVICE_2
+# Optional:
+# wrangler secret put FIXED_IPS
+
+# 6. Deploy
+wrangler deploy
+```
 
 ## API
 
@@ -230,18 +274,17 @@ Scope: Include your account.
 
 ### Fixed IP Ranges
 
-If you have static IPs (office, carrier NAT ranges), set them via environment variable:
+If you have static IPs (office, carrier NAT ranges), add them via the Dashboard:
 
-```bash
-wrangler secret put FIXED_IPS
-# Enter: 203.0.113.0/24,198.51.100.0/24
-```
+1. Worker → **Settings** → **Variables** → **Environment variables**
+2. Add `FIXED_IPS` with value like `203.0.113.0/24,198.51.100.0/24`
+3. Click **Deploy**
 
 These IPs are always included in the whitelist alongside dynamic device IPs.
 
 ### More Devices
 
-Edit `src/index.js`, add entries to `validateKey()`:
+1. Edit `src/index.js`, add entries to `validateKey()`:
 
 ```javascript
 function validateKey(key, env) {
@@ -254,31 +297,35 @@ function validateKey(key, env) {
 }
 ```
 
-Then set the new secret:
-
-```bash
-wrangler secret put KEY_LAPTOP
-```
+2. In the Dashboard, add the new environment variable `KEY_LAPTOP`
+3. Redeploy the Worker
 
 ### IP Limit Per Device
 
-Change `MAX_IPS_PER_DEVICE` in `src/index.js` (default: 8).
+Change `MAX_IPS_PER_DEVICE` in `src/index.js` (default: 8), then redeploy.
 
 ## Updating the Worker
 
-After making changes to `src/index.js`:
+### Via Dashboard
+
+1. Go to your Worker in the Dashboard
+2. Click **Edit code**
+3. Paste the updated code
+4. Click **Deploy**
+
+### Via wrangler (for developers)
 
 ```bash
 wrangler deploy
 ```
 
-To view live logs for debugging:
+View live logs:
 
 ```bash
 wrangler tail
 ```
 
-To check the current state of a device's IPs via API:
+Check a device's current IPs via API:
 
 ```bash
 curl "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=list"

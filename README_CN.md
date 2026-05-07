@@ -41,59 +41,66 @@ Worker 获取 CF-Connecting-IP（你的真实出口 IP）
 ### 准备工作
 
 - Cloudflare 账户（免费版即可）
-- 安装了 `wrangler` CLI（`npm install -g wrangler`，也可使用 `npx wrangler`）
 - 已在 Cloudflare Zero Trust 中创建 Access Policy（如未创建，参考 [官方文档](https://developers.cloudflare.com/cloudflare-one/policies/access/)）
 
-### 1. 创建 KV 命名空间
+---
 
-```bash
-wrangler kv namespace create DEVICE_IPS
-# 将返回的 id 填入 wrangler.toml
-```
+### 方式 A：网页部署（推荐，无需安装任何工具）
 
-### 2. 配置文件
+所有步骤在浏览器里完成，不需要 Node.js，不需要 wrangler。
 
-编辑 `wrangler.toml`：
+#### 1. 创建 Worker
 
-```toml
-name = "cf-ip-whitelist"
-main = "src/index.js"
-compatibility_date = "2024-01-01"
-account_id = "你的账户ID"
+1. 打开 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Workers & Pages**
+2. 点击 **创建应用程序**
+3. 选择 **创建 Worker**
+4. 取个名字（例如 `cf-ip-whitelist`）
+5. 把默认代码替换成 [`src/index.js`](src/index.js) 的内容
+6. 点击 **部署**
 
-kv_namespaces = [
-  { binding = "DEVICE_IPS", id = "你的KV命名空间ID" }
-]
-```
+#### 2. 创建 KV 命名空间
 
-### 3. 设置密钥
+1. 在 Dashboard 里进入 **Workers & Pages** → **KV**
+2. 点击 **创建命名空间**
+3. 名称填 `DEVICE_IPS`
+4. 保存
 
-```bash
-# 必须设置的
-wrangler secret put CF_API_TOKEN    # CF API Token，权限见下方说明
-wrangler secret put ACCOUNT_ID      # Cloudflare 账户 ID
-wrangler secret put POLICY_ID       # 要更新的 Access Policy ID
+#### 3. 绑定 KV 到 Worker
 
-# 设备密钥（每设备一个，使用 openssl rand -hex 16 生成）
-wrangler secret put KEY_DEVICE_1    # 第一个设备
-wrangler secret put KEY_DEVICE_2    # 第二个设备
+1. 回到你的 Worker → **设置** → **变量**
+2. 在 **KV 命名空间绑定** 下点击 **添加绑定**
+3. 填写：
+   - 变量名称：`DEVICE_IPS`
+   - KV 命名空间：选择刚才创建的 `DEVICE_IPS`
+4. 点击 **部署** 保存
 
-# 可选：需要始终包含在白名单中的固定 IP 段（逗号分隔）
-# wrangler secret put FIXED_IPS    # 例如 "203.0.113.0/24,198.51.100.0/24"
-```
+#### 4. 设置环境变量
 
-### 4. 部署
+仍在 Worker → **设置** → **变量** → **环境变量** 里，添加以下变量：
 
-```bash
-wrangler deploy
-# 运行后会返回 URL，格式为：https://cf-ip-whitelist.你的子域名.workers.dev
-```
+| 变量名 | 说明 | 示例 |
+|---|---|---|
+| `CF_API_TOKEN` | Cloudflare API Token | `cfut_...` |
+| `ACCOUNT_ID` | Cloudflare 账户 ID | `d20a6...` |
+| `POLICY_ID` | 要更新的 Access Policy ID | `5800b1...` |
+| `KEY_DEVICE_1` | 设备 1 的随机密钥 | `bd6ec9...` |
+| `KEY_DEVICE_2` | 设备 2 的随机密钥 | `8291e7...` |
+| `FIXED_IPS` | *(可选)* 固定 IP 段 | `203.0.113.0/24` |
 
-### 5. 绑定自定义域名（推荐）
+设备密钥可以用 [uuidgenerator.net](https://www.uuidgenerator.net/) 等工具生成任意随机字符串。
 
-`workers.dev` 在部分地区无法访问。在 Cloudflare Dashboard → Workers → 你的 Worker → 设置 → 域名和路由 → 添加自定义域名。
+添加完所有变量后点击 **部署**。
 
-### 6. 为 Worker 域名设置 Access 放行
+#### 5. 绑定自定义域名
+
+`workers.dev` 在部分地区无法访问，建议绑定自己的域名：
+
+1. Worker → **设置** → **触发器** → **自定义域名**
+2. 点击 **添加自定义域名**
+3. 输入你控制的子域名（例如 `wl.example.com`）
+4. 保存
+
+#### 6. 为 Worker 域名设置 Access 放行
 
 Access Policy 可能会拦截 Worker 自身的请求。为 Worker 域名创建一条 Bypass 策略：
 
@@ -103,12 +110,17 @@ Cloudflare Zero Trust → Access → 应用程序 → 添加
   - 策略：Bypass（所有人）
 ```
 
-### 7. 测试
+#### 7. 测试
+
+在手机浏览器打开：
 
 ```
-# 从手机浏览器访问：
 https://your-worker.example.com/?key=你的设备密钥&action=sync
 ```
+
+如果看到页面显示你的 IP 并提示已添加，说明部署成功。
+
+---
 
 ### 重要：这个链接就是密钥
 
@@ -117,6 +129,38 @@ URL 里的 `key` 等同于一个 bearer token。请把它当作密码保管，�
 ### 重要：请使用专用 Access Policy
 
 这个 Worker 会更新一条简单的 reusable Access Policy。建议单独创建一条专用策略给它使用，不要指向带有审批、MFA、连接规则等高级配置的复杂策略。
+
+---
+
+### 方式 B：使用 wrangler 部署（适合开发者）
+
+如果你习惯命令行或需要用 Git 管理项目：
+
+```bash
+# 1. 安装 wrangler
+npm install -g wrangler
+
+# 2. 登录
+wrangler login
+
+# 3. 创建 KV 命名空间
+wrangler kv namespace create DEVICE_IPS
+# 将返回的 id 填入 wrangler.toml
+
+# 4. 编辑 wrangler.toml，填入 account_id 和 kv_namespace id
+
+# 5. 设置密钥
+wrangler secret put CF_API_TOKEN
+wrangler secret put ACCOUNT_ID
+wrangler secret put POLICY_ID
+wrangler secret put KEY_DEVICE_1
+wrangler secret put KEY_DEVICE_2
+# 可选：
+# wrangler secret put FIXED_IPS
+
+# 6. 部署
+wrangler deploy
+```
 
 ## API 接口
 
@@ -231,16 +275,15 @@ if (isManual) {
 
 ### 固定 IP 段
 
-如果你有固定的 IP（如公司公网出口），可通过环境变量设置，这些 IP 将始终保留在白名单中：
+如果你有固定的 IP（如公司公网出口），在 Dashboard 里添加环境变量：
 
-```bash
-wrangler secret put FIXED_IPS
-# 输入：203.0.113.0/24,198.51.100.0/24
-```
+1. Worker → **设置** → **变量** → **环境变量**
+2. 添加 `FIXED_IPS`，值例如 `203.0.113.0/24,198.51.100.0/24`
+3. 点击 **部署**
 
 ### 添加更多设备
 
-编辑 `src/index.js`，在 `validateKey()` 中添加条目：
+1. 编辑 `src/index.js`，在 `validateKey()` 中添加条目：
 
 ```javascript
 function validateKey(key, env) {
@@ -253,19 +296,23 @@ function validateKey(key, env) {
 }
 ```
 
-然后设置对应的密钥：
-
-```bash
-wrangler secret put KEY_LAPTOP
-```
+2. 在 Dashboard 里添加新的环境变量 `KEY_LAPTOP`
+3. 重新部署 Worker
 
 ### 每设备 IP 存储上限
 
-修改 `src/index.js` 中的 `MAX_IPS_PER_DEVICE`（默认：8）。
+修改 `src/index.js` 中的 `MAX_IPS_PER_DEVICE`（默认：8），然后重新部署。
 
 ## 更新与调试
 
-修改代码后重新部署：
+### 通过 Dashboard 更新
+
+1. 在 Dashboard 进入你的 Worker
+2. 点击 **编辑代码**
+3. 粘贴更新后的代码
+4. 点击 **部署**
+
+### 通过 wrangler 更新（开发者）
 
 ```bash
 wrangler deploy
