@@ -168,6 +168,7 @@ wrangler deploy
 | `GET /?key=KEY&action=add&ip=X.X.X.X` | Adds a specific IP (JSON response) |
 | `GET /?key=KEY&action=list` | Lists all whitelisted IPs for the device (JSON) |
 | `GET /?key=KEY&action=remove&ip=X.X.X.X` | Removes an IP from the device's list |
+| `GET /?key=KEY&action=preview` | Previews the Access Policy include list that will be written (JSON) |
 
 ## Phone Setup
 
@@ -280,7 +281,7 @@ If you have static IPs (office, carrier NAT ranges), add them via the Dashboard:
 2. Add `FIXED_IPS` with value like `203.0.113.0/24,198.51.100.0/24`
 3. Click **Deploy**
 
-These IPs are always included in the whitelist alongside dynamic device IPs.
+These IPs are always included in the whitelist alongside dynamic device IPs. The Worker rebuilds the full Access Policy `include` list on sync, so any IP or CIDR that must be preserved should be listed in `FIXED_IPS`.
 
 ### More Devices
 
@@ -329,6 +330,12 @@ Check a device's current IPs via API:
 
 ```bash
 curl "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=list"
+```
+
+Preview the Access Policy `include` list without modifying it:
+
+```bash
+curl "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=preview"
 ```
 
 ## Important: Bypass Cloudflare Managed Challenge

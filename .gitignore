@@ -1,3 +1,8 @@
 node_modules/
 .wrangler/
 .dev.vars
+
+# Local operator notes. Do not publish environment-specific Cloudflare details.
+USAGE.md
+CF_SETTINGS_OPTIMIZATION.md
+WORKER_UPGRADE_NOTES.md

@@ -1,6 +1,7 @@
 name = "cf-ip-whitelist"
 main = "src/index.js"
-compatibility_date = "2024-01-01"
+compatibility_date = "2026-07-01"
+compatibility_flags = ["nodejs_compat"]
 
 # Your Cloudflare account ID (from Dashboard > right sidebar)
 account_id = "YOUR_ACCOUNT_ID"
@@ -8,3 +9,8 @@ account_id = "YOUR_ACCOUNT_ID"
 kv_namespaces = [
   { binding = "DEVICE_IPS", id = "YOUR_KV_NAMESPACE_ID" }
 ]
+
+# Enable Workers Logs for debugging in the Dashboard
+[observability]
+enabled = true
+head_sampling_rate = 1

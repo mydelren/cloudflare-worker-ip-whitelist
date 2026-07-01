@@ -170,6 +170,7 @@ wrangler deploy
 | `GET /?key=KEY&action=add&ip=X.X.X.X` | 添加指定 IP（返回 JSON） |
 | `GET /?key=KEY&action=list` | 列出当前设备所有白名单 IP（JSON） |
 | `GET /?key=KEY&action=remove&ip=X.X.X.X` | 移除指定 IP |
+| `GET /?key=KEY&action=preview` | 预览即将写入 Access Policy 的 include 列表（JSON） |
 
 ## 手机端使用方式
 
@@ -281,6 +282,8 @@ if (isManual) {
 2. 添加 `FIXED_IPS`，值例如 `203.0.113.0/24,198.51.100.0/24`
 3. 点击 **部署**
 
+这些 IP 会和动态设备 IP 一起写入 Access Policy 的 `include` 列表。Worker 同步时会重建整条 `include`，所以需要长期保留的 IP 或 CIDR 都应该放进 `FIXED_IPS`。
+
 ### 添加更多设备
 
 1. 编辑 `src/index.js`，在 `validateKey()` 中添加条目：
@@ -328,6 +331,12 @@ wrangler tail
 
 ```bash
 curl "https://your-worker.example.com/?key=你的设备密钥&action=list"
+```
+
+预览即将写入 Access Policy 的 `include` 列表（不修改策略）：
+
+```bash
+curl "https://your-worker.example.com/?key=你的设备密钥&action=preview"
 ```
 
 ## 重要：绕过 Cloudflare 人机验证

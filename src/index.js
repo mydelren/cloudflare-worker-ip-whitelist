@@ -34,6 +34,8 @@ export default {
         const ip = url.searchParams.get("ip");
         if (!ip) return jsonResponse({ success: false, error: "Missing ip parameter" }, 400);
         return await handleRemove(device, ip, env);
+      } else if (action === "preview") {
+        return await handlePreview(device, env);
       } else {
         return htmlPage("Error", "<p>Unknown action</p>", 400);
       }
@@ -45,6 +47,7 @@ export default {
 
 const MAX_IPS_PER_DEVICE = 8;
 const DEVICE_KEYS_MAP_KEY = "meta:device_keys";
+const EXISTING_IP_SYNC_INTERVAL_SECONDS = 300;
 
 // ==================== Device Key Validation ====================
 
@@ -192,10 +195,12 @@ async function addIpToDevice(device, ip, env) {
 
   const existing = entries.find((e) => e.ip === ip);
   if (existing) {
-    existing.ts = Math.floor(Date.now() / 1000);
+    const now = Math.floor(Date.now() / 1000);
+    const shouldSync = now - existing.ts >= EXISTING_IP_SYNC_INTERVAL_SECONDS;
+    existing.ts = now;
     await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
-    await syncPolicy(env);
-    return { success: true, changed: false, ip, device, entries: entries.length };
+    if (shouldSync) await syncPolicy(env);
+    return { success: true, changed: false, ip, device, entries: entries.length, synced: shouldSync };
   }
 
   entries.push({ ip, ts: Math.floor(Date.now() / 1000) });
@@ -247,6 +252,17 @@ async function handleRemove(device, ip, env) {
   return jsonResponse({ success: true, action: "removed", ip, device, remaining: entries.length });
 }
 
+async function handlePreview(device, env) {
+  const include = await buildPolicyInclude(env);
+  return jsonResponse({
+    success: true,
+    device,
+    policyId: env.POLICY_ID,
+    include,
+    count: include.length,
+  });
+}
+
 // ==================== Policy Sync ====================
 
 // Fixed IP ranges that are always included in the whitelist.
@@ -266,6 +282,19 @@ function getFixedEntries(env) {
 }
 
 async function syncPolicy(env) {
+  const include = await buildPolicyInclude(env);
+  const policy = await cfFetch(env, "GET", `/access/policies/${env.POLICY_ID}`);
+  const result = policy.result;
+
+  const nextPolicy = { ...result, include };
+  delete nextPolicy.id;
+  delete nextPolicy.created_at;
+  delete nextPolicy.updated_at;
+
+  await cfFetch(env, "PUT", `/access/policies/${env.POLICY_ID}`, nextPolicy);
+}
+
+async function buildPolicyInclude(env) {
   const include = [];
   const seen = new Set();
 
@@ -284,17 +313,7 @@ async function syncPolicy(env) {
     }
   }
 
-  const policy = await cfFetch(env, "GET", `/access/policies/${env.POLICY_ID}`);
-  const result = policy.result;
-
-  await cfFetch(env, "PUT", `/access/policies/${env.POLICY_ID}`, {
-    name: result.name,
-    decision: result.decision,
-    session_duration: result.session_duration || "24h",
-    include,
-    exclude: result.exclude || [],
-    require: result.require || [],
-  });
+  return include;
 }
 
 // ==================== Utilities ====================
