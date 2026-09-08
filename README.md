@@ -368,7 +368,19 @@ You may also use `{"secret":"...","name":"..."}` entries, but referencing env va
 
 ### IP Limit Per Device
 
-Change `MAX_IPS_PER_DEVICE` in `src/index.js` (default: 8), then redeploy.
+Change `MAX_IPS_PER_DEVICE` in `src/lib.js` (default: 8), then redeploy.
+
+## Development
+
+Lightweight unit tests (no heavy deps) for IP normalize + per-device eviction:
+
+```bash
+npm test
+```
+
+Logs for CF API errors, rate limits, sync lock contention, and invalid `DEVICE_KEYS_JSON` are JSON lines via a thin `log(level, msg, fields)` helper.
+
+Policy rebuild uses KV `list({ prefix: "device:" })` as the source of truth for device IP lists (no separate device registry key).
 
 ## Updating the Worker
 
