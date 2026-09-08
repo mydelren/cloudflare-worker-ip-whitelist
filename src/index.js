@@ -87,13 +87,26 @@ async function handleSync(request, device, key, env) {
   const safeCfIpJs = escapeJsString(cfIp || "");
   const cfChanged = cfResult?.changed ? "true" : "false";
 
+  let cfBadgeClass = "ok";
+  let cfBadgeText = "Exists";
+  if (!cfIp) {
+    cfBadgeClass = "err";
+    cfBadgeText = "Missing";
+  } else if (!cfResult) {
+    cfBadgeClass = "err";
+    cfBadgeText = "Invalid";
+  } else if (cfResult.changed) {
+    cfBadgeClass = "added";
+    cfBadgeText = "Added";
+  }
+
   const body = `
     <div id="status">
       <h2>Updating whitelist...</h2>
       <div id="cf-ip" class="item">
         <span class="label">Connection IP:</span>
         <span class="value">${safeCfIpDisplay}</span>
-        <span class="badge ${cfResult?.changed ? "added" : "ok"}">${cfResult?.changed ? "Added" : "Exists"}</span>
+        <span class="badge ${cfBadgeClass}">${cfBadgeText}</span>
       </div>
       <div id="ipv4" class="item">
         <span class="label">IPv4:</span>
@@ -112,6 +125,15 @@ async function handleSync(request, device, key, env) {
       const BASE = "${safeBaseUrl}";
       const KEY = "${safeKey}";
       const CF_IP = "${safeCfIpJs}";
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
 
       async function probe(url, timeout) {
         const ctrl = new AbortController();
@@ -176,7 +198,7 @@ async function handleSync(request, device, key, env) {
           if (ld.success) {
             let html = '<h3>Current whitelist (' + ld.count + '/' + ld.max + ')</h3><ul>';
             for (const e of ld.entries) {
-              html += '<li>' + e.ip + ' <small>' + e.ago + '</small></li>';
+              html += '<li>' + escapeHtml(e.ip) + ' <small>' + escapeHtml(e.ago) + '</small></li>';
             }
             html += '</ul>';
             document.getElementById("entries").innerHTML = html;
@@ -416,7 +438,14 @@ function isIPv6(value) {
     if (!candidate.includes(".")) return false;
     if (!isIPv4(candidate)) return false;
     v4Hextets = 2;
-    head = value.slice(0, lastColon);
+    // Keep "::" intact when compression is adjacent to the IPv4 tail
+    // (e.g. "::192.0.2.1", "2001:db8::192.0.2.1"). Plain "::ffff:x.x.x.x"
+    // still uses the single-colon branch below.
+    if (lastColon > 0 && value[lastColon - 1] === ":") {
+      head = value.slice(0, lastColon + 1);
+    } else {
+      head = value.slice(0, lastColon);
+    }
   }
 
   if (value.includes("::")) {
