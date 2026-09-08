@@ -7,14 +7,15 @@ import {
   flushSync,
   enqueueFlush,
   normalizeAccessIp,
+  trimDeviceEntries,
   escapeHtml,
   escapeJsString,
   timeAgo,
   jsonResponse,
   htmlPage,
   corsHeaders,
-  registerDevice,
   buildPolicyInclude,
+  log,
   MAX_IPS_PER_DEVICE,
   EXISTING_IP_SYNC_INTERVAL_SECONDS,
   RATE_LIMIT_WINDOW_SECONDS,
@@ -70,6 +71,7 @@ export default {
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
     const allowed = await checkRateLimit(device, clientIp, env);
     if (!allowed) {
+      log("warn", "rate_limit_exceeded", { device, clientIp });
       return jsonResponse(
         { success: false, error: "Rate limit exceeded", retryAfter: RATE_LIMIT_WINDOW_SECONDS },
         429,
@@ -99,7 +101,7 @@ export default {
         return htmlPage("Error", "<p>Unknown action</p>", 400);
       }
     } catch (e) {
-      console.error("Worker error:", e);
+      log("error", "worker_error", { error: String(e && e.message ? e.message : e) });
       return htmlPage("Error", "<p>An unexpected error occurred</p>", 500);
     }
   },
@@ -114,7 +116,7 @@ async function handleSync(request, device, key, env, ctx) {
     if (normalizedCfIp) {
       cfResult = await addIpToDevice(device, normalizedCfIp, env);
     } else {
-      console.error("Skipping invalid CF-Connecting-IP:", cfIp);
+      log("error", "invalid_cf_connecting_ip", { cfIp });
     }
   }
 
@@ -297,14 +299,9 @@ async function addIpToDevice(device, ip, env) {
   }
 
   entries.push({ ip: normalized, ts: Math.floor(Date.now() / 1000) });
-
-  if (entries.length > MAX_IPS_PER_DEVICE) {
-    entries.sort((a, b) => b.ts - a.ts);
-    entries = entries.slice(0, MAX_IPS_PER_DEVICE);
-  }
+  entries = trimDeviceEntries(entries, MAX_IPS_PER_DEVICE);
 
   await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
-  await registerDevice(device, env);
   scheduleSync();
 
   return { success: true, changed: true, ip: normalized, device, entries: entries.length, max: MAX_IPS_PER_DEVICE };
@@ -367,4 +364,3 @@ async function handlePreview(device, env, request) {
     count: include.length,
   }, 200, request);
 }
-
