@@ -1,6 +1,4 @@
-
 export const MAX_IPS_PER_DEVICE = 8;
-export const DEVICE_KEYS_MAP_KEY = "meta:device_keys";
 export const EXISTING_IP_SYNC_INTERVAL_SECONDS = 300;
 
 export const POLICY_SYNC_LOCK_KEY = "meta:policy_sync_lock";
@@ -15,6 +13,26 @@ export const RATE_LIMIT_WINDOW_SECONDS = 60;
 
 /** @type {{ dirty: boolean, inFlight: Promise<void> | null }} */
 export const syncCoalesce = { dirty: false, inFlight: null };
+
+
+/**
+ * Thin structured logger (one JSON object per line).
+ * @param {"debug"|"info"|"warn"|"error"} level
+ * @param {string} msg
+ * @param {Record<string, unknown>} [fields]
+ */
+export function log(level, msg, fields = {}) {
+  const line = JSON.stringify({
+    level,
+    msg,
+    ts: new Date().toISOString(),
+    ...fields,
+  });
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+}
+
 
 /**
  * Resolve device list from DEVICE_KEYS_JSON, e.g.
@@ -43,7 +61,7 @@ export function getDeviceEntries(env) {
         if (devices.length > 0) return devices;
       }
     } catch (e) {
-      console.error("Invalid DEVICE_KEYS_JSON:", e);
+      log("error", "invalid_DEVICE_KEYS_JSON", { error: String(e && e.message ? e.message : e) });
     }
   }
   return [
@@ -205,7 +223,7 @@ export async function runSyncWithLock(env) {
 
   const owner = await acquirePolicySyncLock(env);
   if (!owner) {
-    console.warn("Policy sync lock busy; left dirty flag for lock holder");
+    log("warn", "policy_sync_lock_busy", {});
     return;
   }
 
@@ -323,6 +341,22 @@ export function addIncludeEntry(include, seen, ip) {
   include.push({ ip: { ip } });
 }
 
+
+/**
+ * Keep at most `max` device IP entries, preferring newest by `ts`.
+ * Does not mutate the input array.
+ * @param {Array<{ip?: string, ts?: number}>} entries
+ * @param {number} [max]
+ */
+export function trimDeviceEntries(entries, max = MAX_IPS_PER_DEVICE) {
+  if (!Array.isArray(entries)) return [];
+  if (entries.length <= max) return entries.slice();
+  return entries
+    .slice()
+    .sort((a, b) => (Number(b.ts) || 0) - (Number(a.ts) || 0))
+    .slice(0, max);
+}
+
 export function normalizeAccessIp(value) {
   if (typeof value !== "string") return null;
   const ip = value.trim();
@@ -427,15 +461,6 @@ export function escapeJsString(value) {
     .replace(/>/g, "\\u003e");
 }
 
-export async function registerDevice(device, env) {
-  const raw = await env.DEVICE_IPS.get(DEVICE_KEYS_MAP_KEY, "json");
-  const keys = Array.isArray(raw) ? raw : [];
-  if (!keys.includes(device)) {
-    keys.push(device);
-    await env.DEVICE_IPS.put(DEVICE_KEYS_MAP_KEY, JSON.stringify(keys));
-  }
-}
-
 export async function cfFetch(env, method, path, body) {
   const opts = {
     method,
@@ -452,7 +477,7 @@ export async function cfFetch(env, method, path, body) {
   );
   const data = await resp.json();
   if (!data.success) {
-    console.error("CF API error:", data.errors);
+    log("error", "cf_api_error", { errors: data.errors });
     throw new Error("Cloudflare API request failed");
   }
   return data;

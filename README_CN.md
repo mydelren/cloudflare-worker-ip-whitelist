@@ -369,7 +369,19 @@ Worker 运行时使用的 `CF_API_TOKEN` 密钥只需具备更新 Access Policy 
 
 ### 每设备 IP 存储上限
 
-修改 `src/index.js` 中的 `MAX_IPS_PER_DEVICE`（默认：8），然后重新部署。
+修改 `src/lib.js` 中的 `MAX_IPS_PER_DEVICE`（默认：8），然后重新部署。
+
+## 开发
+
+轻量单测（无重依赖），覆盖 IP 规范化与每设备 IP 驱逐：
+
+```bash
+npm test
+```
+
+CF API 错误、限流、同步锁忙、无效 `DEVICE_KEYS_JSON` 使用薄封装 `log(level, msg, fields)` 输出 JSON 行。
+
+策略重建以 KV `list({ prefix: "device:" })` 为设备 IP 真源（不再维护单独的设备注册表 key）。
 
 ## 更新与调试
 
