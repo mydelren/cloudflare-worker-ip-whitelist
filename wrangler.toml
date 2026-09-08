@@ -1,7 +1,6 @@
 name = "cf-ip-whitelist"
 main = "src/index.js"
 compatibility_date = "2026-07-01"
-compatibility_flags = ["nodejs_compat"]
 
 # Your Cloudflare account ID (from Dashboard > right sidebar)
 account_id = "YOUR_ACCOUNT_ID"
