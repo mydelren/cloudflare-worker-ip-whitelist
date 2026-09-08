@@ -1,41 +1,100 @@
-// Cloudflare Worker: Access Policy IP Whitelist Auto-Updater
-// https://github.com/mydelren/cloudflare-worker-ip-whitelist
+import {
+  validateKey,
+  extractDeviceKey,
+  parseRequestBody,
+  checkRateLimit,
+  scheduleSync,
+  flushSync,
+  enqueueFlush,
+  normalizeAccessIp,
+  escapeHtml,
+  escapeJsString,
+  timeAgo,
+  jsonResponse,
+  htmlPage,
+  corsHeaders,
+  registerDevice,
+  buildPolicyInclude,
+  MAX_IPS_PER_DEVICE,
+  EXISTING_IP_SYNC_INTERVAL_SECONDS,
+  RATE_LIMIT_WINDOW_SECONDS,
+} from "./lib.js";
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: corsHeaders() });
+      return new Response(null, { headers: corsHeaders(request) });
     }
 
-    const key = url.searchParams.get("key");
     const action = url.searchParams.get("action") || "sync";
 
+    if ((action === "add" || action === "remove") && request.method !== "POST") {
+      return jsonResponse(
+        {
+          success: false,
+          error: "Method Not Allowed",
+          hint: "Use POST with header X-Device-Key (or Authorization: Bearer) and JSON/form body { ip }. Optional body.key if header omitted. Query key/ip are not accepted for add/remove.",
+        },
+        405,
+        request
+      );
+    }
+
+    if (request.method !== "GET" && request.method !== "POST") {
+      return jsonResponse({ success: false, error: "Method Not Allowed" }, 405, request);
+    }
+
+    let body = null;
+    if (request.method === "POST") {
+      body = await parseRequestBody(request);
+    }
+
+    const key = extractDeviceKey(request, url, body, action);
     if (!key) {
-      return htmlPage("Error", "<p>Missing key parameter</p>", 403);
+      if (action === "sync") {
+        return htmlPage("Error", "<p>Missing key parameter</p>", 403);
+      }
+      return jsonResponse({ success: false, error: "Missing key" }, 403, request);
     }
 
     const device = validateKey(key, env);
     if (!device) {
-      return htmlPage("Error", "<p>Invalid key</p>", 403);
+      if (action === "sync") {
+        return htmlPage("Error", "<p>Invalid key</p>", 403);
+      }
+      return jsonResponse({ success: false, error: "Invalid key" }, 403, request);
+    }
+
+    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
+    const allowed = await checkRateLimit(device, clientIp, env);
+    if (!allowed) {
+      return jsonResponse(
+        { success: false, error: "Rate limit exceeded", retryAfter: RATE_LIMIT_WINDOW_SECONDS },
+        429,
+        request
+      );
     }
 
     try {
       if (action === "sync") {
+        if (request.method !== "GET") {
+          return jsonResponse({ success: false, error: "sync requires GET" }, 405, request);
+        }
         return await handleSync(request, device, key, env, ctx);
       } else if (action === "add") {
-        const ip = url.searchParams.get("ip");
-        if (!ip) return jsonResponse({ success: false, error: "Missing ip parameter" }, 400);
-        return await handleAdd(device, ip, env, ctx);
+        const ip = body && body.ip;
+        if (!ip) return jsonResponse({ success: false, error: "Missing ip" }, 400, request);
+        return await handleAdd(device, ip, env, ctx, request);
       } else if (action === "list") {
-        return await handleList(device, env);
+        return await handleList(device, env, request);
       } else if (action === "remove") {
-        const ip = url.searchParams.get("ip");
-        if (!ip) return jsonResponse({ success: false, error: "Missing ip parameter" }, 400);
-        return await handleRemove(device, ip, env, ctx);
+        const ip = body && body.ip;
+        if (!ip) return jsonResponse({ success: false, error: "Missing ip" }, 400, request);
+        return await handleRemove(device, ip, env, ctx, request);
       } else if (action === "preview") {
-        return await handlePreview(device, env);
+        return await handlePreview(device, env, request);
       } else {
         return htmlPage("Error", "<p>Unknown action</p>", 400);
       }
@@ -45,38 +104,6 @@ export default {
     }
   },
 };
-
-const MAX_IPS_PER_DEVICE = 8;
-const DEVICE_KEYS_MAP_KEY = "meta:device_keys";
-const EXISTING_IP_SYNC_INTERVAL_SECONDS = 300;
-
-// Policy sync coalesce + single-flight (P1)
-const POLICY_SYNC_LOCK_KEY = "meta:policy_sync_lock";
-const POLICY_SYNC_DIRTY_KEY = "meta:policy_sync_dirty";
-const POLICY_SYNC_LOCK_TTL_SECONDS = 15;
-const POLICY_SYNC_DEBOUNCE_MS = 2500;
-const POLICY_SYNC_MAX_FLUSH_ROUNDS = 3;
-const POLICY_SYNC_LOCK_RETRY_MS = 200;
-
-/** @type {{ dirty: boolean, inFlight: Promise<void> | null }} */
-const syncCoalesce = { dirty: false, inFlight: null };
-
-// ==================== Device Key Validation ====================
-
-// Configure your devices here. Each entry maps a secret env var to a device name.
-// Set secrets with: wrangler secret put KEY_<NAME>
-function validateKey(key, env) {
-  const devices = [
-    { key: env.KEY_DEVICE_1, name: "device1" },
-    { key: env.KEY_DEVICE_2, name: "device2" },
-    // Add more devices as needed:
-    // { key: env.KEY_LAPTOP, name: "laptop" },
-  ];
-  const match = devices.find((d) => d.key && d.key === key);
-  return match ? match.name : null;
-}
-
-// ==================== Sync (HTML page) ====================
 
 async function handleSync(request, device, key, env, ctx) {
   const cfIp = request.headers.get("CF-Connecting-IP");
@@ -91,8 +118,6 @@ async function handleSync(request, device, key, env, ctx) {
     }
   }
 
-  // Return HTML quickly; flush policy sync in the background so the page's
-  // sequential client-side add(v4)/add(v6) can land in KV during debounce.
   enqueueFlush(ctx, env);
 
   const baseUrl = new URL(request.url).origin;
@@ -166,7 +191,14 @@ async function handleSync(request, device, key, env, ctx) {
       async function addIp(ip) {
         if (!ip || ip === CF_IP) return { changed: false, skip: true };
         try {
-          const r = await fetch(BASE + "/?key=" + KEY + "&action=add&ip=" + encodeURIComponent(ip));
+          const r = await fetch(BASE + "/?action=add", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "X-Device-Key": KEY,
+            },
+            body: JSON.stringify({ ip: ip }),
+          });
           return await r.json();
         } catch(e) {
           return { error: e.message };
@@ -208,7 +240,9 @@ async function handleSync(request, device, key, env, ctx) {
           '<p class="done">Done! ' + (added > 0 ? added + ' IP(s) added' : 'No new IPs') + '</p>';
 
         try {
-          const lr = await fetch(BASE + "/?key=" + KEY + "&action=list");
+          const lr = await fetch(BASE + "/?action=list", {
+            headers: { "X-Device-Key": KEY },
+          });
           const ld = await lr.json();
           if (ld.success) {
             let html = '<h3>Current whitelist (' + ld.count + '/' + ld.max + ')</h3><ul>';
@@ -229,16 +263,14 @@ async function handleSync(request, device, key, env, ctx) {
   return htmlPage("IP Whitelist - " + device, body);
 }
 
-// ==================== Add / List / Remove ====================
-
-async function handleAdd(device, ip, env, ctx) {
+async function handleAdd(device, ip, env, ctx, request) {
   const normalized = normalizeAccessIp(ip);
   if (!normalized) {
-    return jsonResponse({ success: false, error: "Invalid IP address" }, 400);
+    return jsonResponse({ success: false, error: "Invalid IP address" }, 400, request);
   }
   const result = await addIpToDevice(device, normalized, env);
   await flushSync(env, ctx);
-  return jsonResponse(result);
+  return jsonResponse(result, 200, request);
 }
 
 async function addIpToDevice(device, ip, env) {
@@ -278,7 +310,7 @@ async function addIpToDevice(device, ip, env) {
   return { success: true, changed: true, ip: normalized, device, entries: entries.length, max: MAX_IPS_PER_DEVICE };
 }
 
-async function handleList(device, env) {
+async function handleList(device, env, request) {
   const kvKey = "device:" + device;
   const raw = await env.DEVICE_IPS.get(kvKey, "json");
   const entries = Array.isArray(raw) ? raw : [];
@@ -293,10 +325,10 @@ async function handleList(device, env) {
     })),
     count: entries.length,
     max: MAX_IPS_PER_DEVICE,
-  });
+  }, 200, request);
 }
 
-async function handleRemove(device, ip, env, ctx) {
+async function handleRemove(device, ip, env, ctx, request) {
   const normalized = normalizeAccessIp(ip);
   const kvKey = "device:" + device;
   const raw = await env.DEVICE_IPS.get(kvKey, "json");
@@ -309,7 +341,7 @@ async function handleRemove(device, ip, env, ctx) {
   });
 
   if (entries.length === before) {
-    return jsonResponse({ success: false, error: "IP not found for " + device }, 404);
+    return jsonResponse({ success: false, error: "IP not found for " + device }, 404, request);
   }
 
   await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
@@ -322,10 +354,10 @@ async function handleRemove(device, ip, env, ctx) {
     ip: normalized || ip,
     device,
     remaining: entries.length,
-  });
+  }, 200, request);
 }
 
-async function handlePreview(device, env) {
+async function handlePreview(device, env, request) {
   const include = await buildPolicyInclude(env);
   return jsonResponse({
     success: true,
@@ -333,395 +365,6 @@ async function handlePreview(device, env) {
     policyId: env.POLICY_ID,
     include,
     count: include.length,
-  });
+  }, 200, request);
 }
 
-// ==================== Policy Sync ====================
-
-// Fixed IP ranges that are always included in the whitelist.
-// Set via environment variable: wrangler secret put FIXED_IPS
-// Format: comma-separated CIDRs, e.g. "203.0.113.0/24,198.51.100.0/24"
-// Leave empty (default) if you have no fixed IPs.
-function getFixedEntries(env) {
-  const fixedIps = env.FIXED_IPS || "";
-  if (!fixedIps.trim()) return [];
-  return fixedIps
-    .split(",")
-    .map((ip) => ip.trim())
-    .filter(Boolean)
-    .map(normalizeAccessIp)
-    .filter(Boolean)
-    .map((ip) => ({ ip: { ip } }));
-}
-
-/** Mark that an Access Policy PUT is needed (in-memory coalesce per isolate). */
-function scheduleSync() {
-  syncCoalesce.dirty = true;
-}
-
-function enqueueFlush(ctx, env) {
-  if (!syncCoalesce.dirty && !syncCoalesce.inFlight) return;
-  const p = flushSync(env, null);
-  if (ctx && typeof ctx.waitUntil === "function") {
-    ctx.waitUntil(p);
-  }
-  return p;
-}
-
-/**
- * Flush coalesced sync work once. Prefer awaiting from mutate handlers;
- * sync page uses waitUntil so HTML returns while debounce absorbs client adds.
- */
-async function flushSync(env, ctx) {
-  if (syncCoalesce.inFlight) {
-    // Piggy-back on in-flight flush; ensure a follow-up if more dirt arrives.
-    syncCoalesce.dirty = true;
-    await syncCoalesce.inFlight;
-    if (syncCoalesce.dirty) return flushSync(env, ctx);
-    return;
-  }
-  if (!syncCoalesce.dirty) return;
-
-  syncCoalesce.dirty = false;
-  const p = runSyncWithLock(env);
-  syncCoalesce.inFlight = p;
-  try {
-    await p;
-  } finally {
-    if (syncCoalesce.inFlight === p) syncCoalesce.inFlight = null;
-  }
-  if (syncCoalesce.dirty) {
-    if (ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(flushSync(env, null));
-      return;
-    }
-    return flushSync(env, null);
-  }
-}
-
-async function runSyncWithLock(env) {
-  await markPolicySyncDirty(env);
-
-  const owner = await acquirePolicySyncLock(env);
-  if (!owner) {
-    // Another isolate holds the lock; dirty flag is set for the leader to re-flush.
-    console.warn("Policy sync lock busy; left dirty flag for lock holder");
-    return;
-  }
-
-  try {
-    // Short debounce so rapid sequential HTTP adds (sync page v4+v6) share one PUT.
-    await sleep(POLICY_SYNC_DEBOUNCE_MS);
-
-    for (let round = 0; round < POLICY_SYNC_MAX_FLUSH_ROUNDS; round++) {
-      await clearPolicySyncDirty(env);
-      // Always rebuild include from current KV (+ FIXED_IPS) at PUT time.
-      await syncPolicyOnce(env);
-      if (!(await isPolicySyncDirty(env))) break;
-      await sleep(150);
-    }
-  } finally {
-    await releasePolicySyncLock(env, owner);
-  }
-
-  // Waiter may have marked dirty after our last check but before release.
-  if (await isPolicySyncDirty(env)) {
-    await runSyncWithLock(env);
-  }
-}
-
-async function syncPolicyOnce(env) {
-  const include = await buildPolicyInclude(env);
-  const policy = await cfFetch(env, "GET", `/access/policies/${env.POLICY_ID}`);
-  const result = policy.result;
-
-  const nextPolicy = { ...result, include };
-  delete nextPolicy.id;
-  delete nextPolicy.created_at;
-  delete nextPolicy.updated_at;
-
-  await cfFetch(env, "PUT", `/access/policies/${env.POLICY_ID}`, nextPolicy);
-}
-
-async function markPolicySyncDirty(env) {
-  await env.DEVICE_IPS.put(POLICY_SYNC_DIRTY_KEY, String(Date.now()), {
-    expirationTtl: 60,
-  });
-}
-
-async function clearPolicySyncDirty(env) {
-  await env.DEVICE_IPS.delete(POLICY_SYNC_DIRTY_KEY);
-}
-
-async function isPolicySyncDirty(env) {
-  const v = await env.DEVICE_IPS.get(POLICY_SYNC_DIRTY_KEY);
-  return v != null;
-}
-
-async function acquirePolicySyncLock(env) {
-  // Prefer deferring to an existing lock holder (dirty flag) over stampedes.
-  // A couple of quick retries cover stale/expired lease races.
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const owner = await tryAcquirePolicySyncLock(env);
-    if (owner) return owner;
-    await sleep(POLICY_SYNC_LOCK_RETRY_MS);
-  }
-  return null;
-}
-
-async function tryAcquirePolicySyncLock(env) {
-  const now = Date.now();
-  const current = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
-  if (current && typeof current.expiresAt === "number" && current.expiresAt > now) {
-    return null;
-  }
-
-  const owner = crypto.randomUUID();
-  const expiresAt = now + POLICY_SYNC_LOCK_TTL_SECONDS * 1000;
-  await env.DEVICE_IPS.put(
-    POLICY_SYNC_LOCK_KEY,
-    JSON.stringify({ owner, expiresAt }),
-    { expirationTtl: POLICY_SYNC_LOCK_TTL_SECONDS + 5 }
-  );
-
-  // Best-effort verify (KV has no compare-and-swap).
-  const verify = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
-  if (verify && verify.owner === owner) return owner;
-  return null;
-}
-
-async function releasePolicySyncLock(env, owner) {
-  const current = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
-  if (current && current.owner === owner) {
-    await env.DEVICE_IPS.delete(POLICY_SYNC_LOCK_KEY);
-  }
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function buildPolicyInclude(env) {
-  const include = [];
-  const seen = new Set();
-
-  for (const entry of getFixedEntries(env)) {
-    addIncludeEntry(include, seen, entry.ip.ip);
-  }
-
-  const list = await env.DEVICE_IPS.list({ prefix: "device:" });
-  for (const kvKey of list.keys) {
-    const raw = await env.DEVICE_IPS.get(kvKey.name, "json");
-    if (!Array.isArray(raw)) continue;
-
-    for (const entry of raw) {
-      const normalized = normalizeAccessIp(entry.ip);
-      if (normalized) addIncludeEntry(include, seen, normalized);
-    }
-  }
-
-  return include;
-}
-
-// ==================== Utilities ====================
-
-function addIncludeEntry(include, seen, ip) {
-  if (seen.has(ip)) return;
-  seen.add(ip);
-  include.push({ ip: { ip } });
-}
-
-function normalizeAccessIp(value) {
-  if (typeof value !== "string") return null;
-  const ip = value.trim();
-  if (!ip) return null;
-
-  if (ip.includes("/")) {
-    const [addr, prefix, extra] = ip.split("/");
-    if (extra || !prefix) return null;
-    if (isIPv4(addr)) {
-      const n = Number(prefix);
-      return Number.isInteger(n) && n >= 0 && n <= 32 ? `${addr}/${n}` : null;
-    }
-    if (isIPv6(addr)) {
-      const n = Number(prefix);
-      return Number.isInteger(n) && n >= 0 && n <= 128 ? `${addr}/${n}` : null;
-    }
-    return null;
-  }
-
-  if (isIPv4(ip)) return ip + "/32";
-  if (isIPv6(ip)) return ip + "/128";
-  return null;
-}
-
-function isIPv4(value) {
-  const parts = value.split(".");
-  if (parts.length !== 4) return false;
-  return parts.every((part) => {
-    if (!/^\d+$/.test(part)) return false;
-    if (part.length > 1 && part.startsWith("0")) return false;
-    const n = Number(part);
-    return n >= 0 && n <= 255;
-  });
-}
-
-function isHexGroup(group) {
-  return /^[0-9a-fA-F]{1,4}$/.test(group);
-}
-
-function isIPv6(value) {
-  if (typeof value !== "string") return false;
-  if (!value.includes(":")) return false;
-  if (/[^0-9a-fA-F:.]/.test(value)) return false;
-  if (value.includes(":::")) return false;
-
-  const doubleColons = value.match(/::/g);
-  if (doubleColons && doubleColons.length > 1) return false;
-
-  let head = value;
-  let v4Hextets = 0;
-
-  if (value.includes(".")) {
-    const lastColon = value.lastIndexOf(":");
-    if (lastColon < 0) return false;
-    const candidate = value.slice(lastColon + 1);
-    if (!candidate.includes(".")) return false;
-    if (!isIPv4(candidate)) return false;
-    v4Hextets = 2;
-    // Keep "::" intact when compression is adjacent to the IPv4 tail
-    // (e.g. "::192.0.2.1", "2001:db8::192.0.2.1"). Plain "::ffff:x.x.x.x"
-    // still uses the single-colon branch below.
-    if (lastColon > 0 && value[lastColon - 1] === ":") {
-      head = value.slice(0, lastColon + 1);
-    } else {
-      head = value.slice(0, lastColon);
-    }
-  }
-
-  if (value.includes("::")) {
-    const parts = head.split("::");
-    if (parts.length !== 2) return false;
-    const left = parts[0] === "" ? [] : parts[0].split(":");
-    const right = parts[1] === "" ? [] : parts[1].split(":");
-    if (left.some((g) => g === "") || right.some((g) => g === "")) return false;
-    if (![...left, ...right].every(isHexGroup)) return false;
-    const present = left.length + right.length + v4Hextets;
-    return present < 8;
-  }
-
-  const groups = head === "" ? [] : head.split(":");
-  if (groups.some((g) => g === "")) return false;
-  if (!groups.every(isHexGroup)) return false;
-  return groups.length + v4Hextets === 8;
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
-}
-
-function escapeJsString(value) {
-  return String(value)
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\u2028/g, "\\u2028")
-    .replace(/\u2029/g, "\\u2029")
-    .replace(/</g, "\\u003c")
-    .replace(/>/g, "\\u003e");
-}
-
-async function registerDevice(device, env) {
-  const raw = await env.DEVICE_IPS.get(DEVICE_KEYS_MAP_KEY, "json");
-  const keys = Array.isArray(raw) ? raw : [];
-  if (!keys.includes(device)) {
-    keys.push(device);
-    await env.DEVICE_IPS.put(DEVICE_KEYS_MAP_KEY, JSON.stringify(keys));
-  }
-}
-
-async function cfFetch(env, method, path, body) {
-  const opts = {
-    method,
-    headers: {
-      Authorization: "Bearer " + env.CF_API_TOKEN,
-      "Content-Type": "application/json",
-    },
-  };
-  if (body) opts.body = JSON.stringify(body);
-
-  const resp = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.ACCOUNT_ID}${path}`,
-    opts
-  );
-  const data = await resp.json();
-  if (!data.success) {
-    console.error("CF API error:", data.errors);
-    throw new Error("Cloudflare API request failed");
-  }
-  return data;
-}
-
-function timeAgo(ts) {
-  const diff = Math.floor(Date.now() / 1000) - ts;
-  if (diff < 60) return diff + "s ago";
-  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
-  if (diff < 86400) return Math.floor(diff / 3600) + "h ago";
-  return Math.floor(diff / 86400) + "d ago";
-}
-
-function jsonResponse(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8" },
-  });
-}
-
-function htmlPage(title, body, status = 200) {
-  const html = `<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(title)}</title>
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px;min-height:100vh}
-h2{color:#0ff;margin-bottom:16px;font-size:18px}
-h3{color:#aaa;margin:20px 0 10px;font-size:14px}
-.item{display:flex;align-items:center;gap:8px;padding:10px;margin:6px 0;background:#16213e;border-radius:8px;font-size:14px}
-.label{color:#888;min-width:60px}
-.value{flex:1;word-break:break-all;font-family:monospace;font-size:13px}
-.badge{padding:2px 8px;border-radius:4px;font-size:12px;white-space:nowrap}
-.badge.added{background:#0a3;color:#fff}
-.badge.ok{background:#555;color:#ccc}
-.badge.err{background:#a00;color:#fff}
-.done{margin-top:16px;padding:12px;background:#0a3;border-radius:8px;text-align:center;font-weight:bold}
-ul{list-style:none;padding:0}
-li{padding:8px 10px;margin:4px 0;background:#16213e;border-radius:6px;font-family:monospace;font-size:13px}
-li small{color:#888;margin-left:8px}
-</style>
-</head>
-<body>
-${body}
-</body>
-</html>`;
-  return new Response(html, {
-    status,
-    headers: { "Content-Type": "text/html; charset=utf-8" },
-  });
-}
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
-  };
-}

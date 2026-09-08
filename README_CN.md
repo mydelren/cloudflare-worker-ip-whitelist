@@ -85,9 +85,12 @@ Worker 获取 CF-Connecting-IP（你的真实出口 IP）
 | `POLICY_ID` | 要更新的 Access Policy ID | `5800b1...` |
 | `KEY_DEVICE_1` | 设备 1 的随机密钥 | `bd6ec9...` |
 | `KEY_DEVICE_2` | 设备 2 的随机密钥 | `8291e7...` |
+| `DEVICE_KEYS_JSON` | *(可选)* 设备映射 JSON — 无需改代码即可加设备 | 见 [添加更多设备](#添加更多设备) |
 | `FIXED_IPS` | *(可选)* 固定 IP 段 | `203.0.113.0/24` |
 
 设备密钥可以用 [uuidgenerator.net](https://www.uuidgenerator.net/) 等工具生成任意随机字符串。
+
+设置了 `DEVICE_KEYS_JSON` 时，设备密钥从 JSON 里引用的环境变量读取（推荐）。未设置时回退到 `KEY_DEVICE_1` / `KEY_DEVICE_2`。
 
 添加完所有变量后点击 **部署**。
 
@@ -157,6 +160,8 @@ wrangler secret put KEY_DEVICE_1
 wrangler secret put KEY_DEVICE_2
 # 可选：
 # wrangler secret put FIXED_IPS
+# 普通环境变量设备映射 — 见「添加更多设备」：
+# DEVICE_KEYS_JSON='[{"env":"KEY_DEVICE_1","name":"device1"},{"env":"KEY_DEVICE_2","name":"device2"}]'
 
 # 6. 部署
 wrangler deploy
@@ -164,13 +169,49 @@ wrangler deploy
 
 ## API 接口
 
-| 接口 | 说明 |
-|---|---|
-| `GET /?key=KEY&action=sync` | 记录连接 IP 并返回自动探测双栈的 HTML 页面 |
-| `GET /?key=KEY&action=add&ip=X.X.X.X` | 添加指定 IP（返回 JSON） |
-| `GET /?key=KEY&action=list` | 列出当前设备所有白名单 IP（JSON） |
-| `GET /?key=KEY&action=remove&ip=X.X.X.X` | 移除指定 IP |
-| `GET /?key=KEY&action=preview` | 预览即将写入 Access Policy 的 include 列表（JSON） |
+| 接口 | 方法 | 鉴权 | 说明 |
+|---|---|---|---|
+| `/?action=sync` | `GET` | Query `key`（书签）或 `X-Device-Key` / `Authorization: Bearer` | 记录连接 IP + 自动探测双栈的 HTML 页面 |
+| `/?action=add` | **仅 POST** | 优先 Header（`X-Device-Key` 或 Bearer）；body `key` 亦可。**禁止 query key/ip** | 添加 IP。Body：`{ "ip": "..." }`（JSON 或表单） |
+| `/?action=list` | `GET` | 优先 Header；query `key` 仍可用 | 列出当前设备白名单（JSON） |
+| `/?action=remove` | **仅 POST** | 同 add | 移除 IP。Body：`{ "ip": "..." }` |
+| `/?action=preview` | `GET` | 优先 Header；query `key` 仍可用 | 预览 Access Policy `include`（JSON） |
+
+**变更操作（`add` / `remove`）**：GET 返回 `405` 并提示改用 POST。变更请求不要把密钥放进 query。
+
+**鉴权优先级**：`X-Device-Key` → `Authorization: Bearer <key>` → POST body `key` →（仅 GET）query `key`。
+
+**CORS**：仅当请求 `Origin` 与本 Worker URL origin 一致时才反射；从不使用 `*`。允许 `GET`、`POST`、`OPTIONS`。
+
+**限流**：校验密钥后，每个设备密钥 + 客户端 IP 约 30 次 / 60 秒（KV）。超额返回 `429` JSON。
+
+### 示例
+
+```bash
+# 同步（书签 / 浏览器）
+open "https://your-worker.example.com/?key=你的设备密钥&action=sync"
+
+# 添加 IP（POST + header）
+curl -X POST "https://your-worker.example.com/?action=add" \
+  -H "Content-Type: application/json" \
+  -H "X-Device-Key: 你的设备密钥" \
+  -d '{"ip":"203.0.113.10"}'
+
+# 添加 IP（POST + body key）
+curl -X POST "https://your-worker.example.com/?action=add" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"你的设备密钥","ip":"203.0.113.10"}'
+
+# 列表（header）
+curl "https://your-worker.example.com/?action=list" \
+  -H "X-Device-Key: 你的设备密钥"
+
+# 移除
+curl -X POST "https://your-worker.example.com/?action=remove" \
+  -H "Content-Type: application/json" \
+  -H "X-Device-Key: 你的设备密钥" \
+  -d '{"ip":"203.0.113.10"}'
+```
 
 ## 手机端使用方式
 
@@ -196,11 +237,17 @@ const DEVICE_KEY = "你的设备密钥";
 // 判断是手动触发还是自动化触发
 const isManual = !args.shortcutParameter;
 
-async function callWorker(action, params) {
-  let url = WORKER_URL + "/?key=" + DEVICE_KEY + "&action=" + action;
-  if (params) url += "&" + params;
+async function callWorker(action, bodyObj) {
+  // add/remove 必须 POST；密钥走 header，不进 query
+  const url = WORKER_URL + "/?action=" + action;
   try {
     const r = new Request(url);
+    r.method = "POST";
+    r.headers = {
+      "Content-Type": "application/json",
+      "X-Device-Key": DEVICE_KEY,
+    };
+    r.body = JSON.stringify(bodyObj || {});
     const text = await r.loadString();
     return JSON.parse(text);
   } catch(e) { return { error: e.message }; }
@@ -232,12 +279,12 @@ if (isManual) {
   let added = 0;
   let result = "";
   if (v4) {
-    const r4 = await callWorker("add", "ip=" + encodeURIComponent(v4));
+    const r4 = await callWorker("add", { ip: v4 });
     result += "IPv4: " + v4 + (r4.changed ? " (已添加)" : " (已存在)") + "\n";
     if (r4.changed) added++;
   }
   if (v6 && v6.includes(":")) {
-    const r6 = await callWorker("add", "ip=" + encodeURIComponent(v6));
+    const r6 = await callWorker("add", { ip: v6 });
     result += "IPv6: " + v6 + (r6.changed ? " (已添加)" : " (已存在)") + "\n";
     if (r6.changed) added++;
   }
@@ -257,7 +304,7 @@ if (isManual) {
    ```
    https://your-worker.example.com/?key=你的设备密钥&action=sync
    ```
-3. 将此快捷方式收藏到桌面，IP 变化时点击运行即可。也可以继续只用浏览器书签。
+3. 将此快捷方式收藏到桌面，IP 变化时点击运行即可。也可以继续只用浏览器书签。若需要 `add`/`remove`，请用 `POST` + JSON body，并设置 Header `X-Device-Key`（不要把密钥拼进 query）。
 
 ## Cloudflare API Token
 
@@ -299,23 +346,26 @@ Worker 运行时使用的 `CF_API_TOKEN` 密钥只需具备更新 Access Policy 
 
 这些 IP 会和动态设备 IP 一起写入 Access Policy 的 `include` 列表。Worker 同步时会重建整条 `include`，所以需要长期保留的 IP 或 CIDR 都应该放进 `FIXED_IPS`。
 
-### 添加更多设备
+### 添加更多设备（无需改代码）
 
-1. 编辑 `src/index.js`，在 `validateKey()` 中添加条目：
+推荐：设置普通环境变量 `DEVICE_KEYS_JSON`，把密钥环境变量名映射到设备名。密钥仍存放在各自的 Secret 里；JSON 只引用变量名。
 
-```javascript
-function validateKey(key, env) {
-  const devices = [
-    { key: env.KEY_DEVICE_1, name: "device1" },
-    { key: env.KEY_DEVICE_2, name: "device2" },
-    { key: env.KEY_LAPTOP, name: "laptop" },  // 新设备
-  ];
-  // ...
-}
+1. 为新设备创建 Secret（Dashboard **变量** / `wrangler secret put KEY_LAPTOP`）
+2. 设置 `DEVICE_KEYS_JSON`（普通文本环境变量即可）：
+
+```json
+[
+  {"env":"KEY_DEVICE_1","name":"device1"},
+  {"env":"KEY_DEVICE_2","name":"device2"},
+  {"env":"KEY_LAPTOP","name":"laptop"}
+]
 ```
 
-2. 在 Dashboard 里添加新的环境变量 `KEY_LAPTOP`
-3. 重新部署 Worker
+3. 保存变量 / 部署 — **不必**修改 `src/index.js`。
+
+若未设置或为空，Worker 回退到硬编码的 `KEY_DEVICE_1` → `device1`、`KEY_DEVICE_2` → `device2`。
+
+也支持 `{"secret":"...","name":"..."}`，但更推荐用 `env` 引用密钥变量名，避免在 JSON 里重复存放密钥。
 
 ### 每设备 IP 存储上限
 
@@ -345,13 +395,15 @@ wrangler tail
 通过 API 查询某设备当前的白名单状态：
 
 ```bash
-curl "https://your-worker.example.com/?key=你的设备密钥&action=list"
+curl "https://your-worker.example.com/?action=list" \
+  -H "X-Device-Key: 你的设备密钥"
 ```
 
 预览即将写入 Access Policy 的 `include` 列表（不修改策略）：
 
 ```bash
-curl "https://your-worker.example.com/?key=你的设备密钥&action=preview"
+curl "https://your-worker.example.com/?action=preview" \
+  -H "X-Device-Key: 你的设备密钥"
 ```
 
 ## 重要：绕过 Cloudflare 人机验证
@@ -408,7 +460,7 @@ Cloudflare 官方文档明确说明：*"Cloudflare challenges are generally not 
 ### 需要加入的域名
 
 | 域名 | 原因 |
-|---|---|---|
+|---|---|
 | Worker 域名 | 确保 IP 刷新页面正常加载 |
 | App 直连域名 | 确保 App 请求能通过（App 无法完成验证） |
 | **不要加入** 仅浏览器访问的管理域名 | 可按需保留这些域名的验证保护 |
@@ -428,7 +480,9 @@ Cloudflare 官方文档明确说明：*"Cloudflare challenges are generally not 
 ## 安全说明
 
 - 设备密钥存储为 Worker Secrets，不会暴露给客户端
-- `key` 会出现在 URL 里，所以同步链接本身必须保密
+- 同步书签仍会把 `key` 放进 URL，请保密该链接。变更操作（`add`/`remove`）使用 POST + header/body，不必把密钥放进 query
+- CORS 从不反射 `*`；仅当 `Origin` 与本 Worker origin 一致时才允许
+- 鉴权通过后按设备密钥 + 客户端 IP 限流（约 30 次/分钟）
 - 每个设备密钥映射到 KV 中唯一的设备名
 - IP 带时间戳存储，最旧的条目自动淘汰
 - Worker 仅有权限读写指定的 Access Policy

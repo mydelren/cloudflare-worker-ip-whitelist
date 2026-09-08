@@ -83,9 +83,12 @@ Still in your Worker → **Settings** → **Variables** → **Environment variab
 | `POLICY_ID` | The Access Policy ID to update | `5800b1...` |
 | `KEY_DEVICE_1` | Random secret for device 1 | `bd6ec9...` |
 | `KEY_DEVICE_2` | Random secret for device 2 | `8291e7...` |
+| `DEVICE_KEYS_JSON` | *(Optional)* Device map JSON — add devices without code change | See [More Devices](#more-devices) |
 | `FIXED_IPS` | *(Optional)* Fixed CIDRs | `203.0.113.0/24` |
 
 Generate device keys with any random string (e.g. from [uuidgenerator.net](https://www.uuidgenerator.net/)).
+
+With `DEVICE_KEYS_JSON` set, device secrets are read from the env vars named in the JSON (recommended). Without it, the Worker falls back to `KEY_DEVICE_1` / `KEY_DEVICE_2`.
 
 Click **Deploy** after adding all variables.
 
@@ -155,6 +158,8 @@ wrangler secret put KEY_DEVICE_1
 wrangler secret put KEY_DEVICE_2
 # Optional:
 # wrangler secret put FIXED_IPS
+# Plain env (not secret) for device map — see More Devices:
+# DEVICE_KEYS_JSON='[{"env":"KEY_DEVICE_1","name":"device1"},{"env":"KEY_DEVICE_2","name":"device2"}]'
 
 # 6. Deploy
 wrangler deploy
@@ -162,13 +167,49 @@ wrangler deploy
 
 ## API
 
-| Endpoint | Description |
-|---|---|
-| `GET /?key=KEY&action=sync` | Records connection IP + returns HTML page that auto-detects dual-stack |
-| `GET /?key=KEY&action=add&ip=X.X.X.X` | Adds a specific IP (JSON response) |
-| `GET /?key=KEY&action=list` | Lists all whitelisted IPs for the device (JSON) |
-| `GET /?key=KEY&action=remove&ip=X.X.X.X` | Removes an IP from the device's list |
-| `GET /?key=KEY&action=preview` | Previews the Access Policy include list that will be written (JSON) |
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/?action=sync` | `GET` | Query `key` (bookmark UX) or `X-Device-Key` / `Authorization: Bearer` | Records connection IP + HTML page that auto-detects dual-stack |
+| `/?action=add` | `POST` only | Header preferred (`X-Device-Key` or Bearer); body `key` ok. **No query key/ip** | Adds a specific IP. Body: `{ "ip": "..." }` (JSON or form) |
+| `/?action=list` | `GET` | Header preferred; query `key` still accepted for simple curls | Lists whitelisted IPs for the device (JSON) |
+| `/?action=remove` | `POST` only | Same as add | Removes an IP. Body: `{ "ip": "..." }` |
+| `/?action=preview` | `GET` | Header preferred; query `key` still accepted | Previews Access Policy `include` list (JSON) |
+
+**Mutations (`add` / `remove`)**: GET returns `405` with a hint to use POST. Do not put secrets in query strings for mutations.
+
+**Auth priority**: `X-Device-Key` → `Authorization: Bearer <key>` → POST body `key` → (GET only) query `key`.
+
+**CORS**: Reflects `Origin` only when it matches this Worker URL origin (never `*`). Allows `GET`, `POST`, `OPTIONS`.
+
+**Rate limit**: After a valid key, ~30 requests / 60s per device key + client IP (KV-backed). Exceeded → `429` JSON.
+
+### Examples
+
+```bash
+# Sync (bookmark / browser)
+open "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync"
+
+# Add IP (POST + header)
+curl -X POST "https://your-worker.example.com/?action=add" \
+  -H "Content-Type: application/json" \
+  -H "X-Device-Key: YOUR_DEVICE_KEY" \
+  -d '{"ip":"203.0.113.10"}'
+
+# Add IP (POST + body key)
+curl -X POST "https://your-worker.example.com/?action=add" \
+  -H "Content-Type: application/json" \
+  -d '{"key":"YOUR_DEVICE_KEY","ip":"203.0.113.10"}'
+
+# List (header)
+curl "https://your-worker.example.com/?action=list" \
+  -H "X-Device-Key: YOUR_DEVICE_KEY"
+
+# Remove
+curl -X POST "https://your-worker.example.com/?action=remove" \
+  -H "Content-Type: application/json" \
+  -H "X-Device-Key: YOUR_DEVICE_KEY" \
+  -d '{"ip":"203.0.113.10"}'
+```
 
 ## Phone Setup
 
@@ -194,11 +235,17 @@ const DEVICE_KEY = "YOUR_DEVICE_KEY";
 // Detect manual vs automated
 const isManual = !args.shortcutParameter;
 
-async function callWorker(action, params) {
-  let url = WORKER_URL + "/?key=" + DEVICE_KEY + "&action=" + action;
-  if (params) url += "&" + params;
+async function callWorker(action, bodyObj) {
+  // Mutations (add/remove) must be POST; key via header (not query)
+  const url = WORKER_URL + "/?action=" + action;
   try {
     const r = new Request(url);
+    r.method = "POST";
+    r.headers = {
+      "Content-Type": "application/json",
+      "X-Device-Key": DEVICE_KEY,
+    };
+    r.body = JSON.stringify(bodyObj || {});
     const text = await r.loadString();
     return JSON.parse(text);
   } catch(e) { return { error: e.message }; }
@@ -232,12 +279,12 @@ if (isManual) {
   let added = 0;
   let result = "";
   if (v4) {
-    const r4 = await callWorker("add", "ip=" + encodeURIComponent(v4));
+    const r4 = await callWorker("add", { ip: v4 });
     result += "IPv4: " + v4 + (r4.changed ? " (added)" : " (exists)") + "\n";
     if (r4.changed) added++;
   }
   if (v6 && v6.includes(":")) {
-    const r6 = await callWorker("add", "ip=" + encodeURIComponent(v6));
+    const r6 = await callWorker("add", { ip: v6 });
     result += "IPv6: " + v6 + (r6.changed ? " (added)" : " (exists)") + "\n";
     if (r6.changed) added++;
   }
@@ -256,7 +303,7 @@ if (isManual) {
 2. Create a "Basic Request" shortcut:
    - Method: `GET`
    - URL: `https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=sync`
-3. Optionally create extra shortcuts for `add`, `list`, or `remove` if you want manual control beyond the main sync link.
+3. Optionally create extra shortcuts: use `GET` for `list`/`preview` (header or query key), and `POST` with JSON body + `X-Device-Key` for `add`/`remove`.
 
 ## Cloudflare API Token
 
@@ -298,23 +345,26 @@ If you have static IPs (office, carrier NAT ranges), add them via the Dashboard:
 
 These IPs are always included in the whitelist alongside dynamic device IPs. The Worker rebuilds the full Access Policy `include` list on sync, so any IP or CIDR that must be preserved should be listed in `FIXED_IPS`.
 
-### More Devices
+### More Devices (no code change)
 
-1. Edit `src/index.js`, add entries to `validateKey()`:
+Preferred: set a plain env var `DEVICE_KEYS_JSON` that maps secret env names to device names. Secrets stay in separate secret vars; the JSON only references their names.
 
-```javascript
-function validateKey(key, env) {
-  const devices = [
-    { key: env.KEY_DEVICE_1, name: "device1" },
-    { key: env.KEY_DEVICE_2, name: "device2" },
-    { key: env.KEY_LAPTOP, name: "laptop" },  // Add this
-  ];
-  // ...
-}
+1. Create a secret for the new device (Dashboard **Variables** / `wrangler secret put KEY_LAPTOP`)
+2. Set `DEVICE_KEYS_JSON` (plain text env var is fine):
+
+```json
+[
+  {"env":"KEY_DEVICE_1","name":"device1"},
+  {"env":"KEY_DEVICE_2","name":"device2"},
+  {"env":"KEY_LAPTOP","name":"laptop"}
+]
 ```
 
-2. In the Dashboard, add the new environment variable `KEY_LAPTOP`
-3. Redeploy the Worker
+3. Deploy / save variables — no `src/index.js` edit required.
+
+If `DEVICE_KEYS_JSON` is absent or empty, the Worker falls back to hard-coded `KEY_DEVICE_1` → `device1` and `KEY_DEVICE_2` → `device2`.
+
+You may also use `{"secret":"...","name":"..."}` entries, but referencing env var names (`env`) is preferred so secrets are not duplicated in JSON.
 
 ### IP Limit Per Device
 
@@ -344,13 +394,15 @@ wrangler tail
 Check a device's current IPs via API:
 
 ```bash
-curl "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=list"
+curl "https://your-worker.example.com/?action=list" \
+  -H "X-Device-Key: YOUR_DEVICE_KEY"
 ```
 
 Preview the Access Policy `include` list without modifying it:
 
 ```bash
-curl "https://your-worker.example.com/?key=YOUR_DEVICE_KEY&action=preview"
+curl "https://your-worker.example.com/?action=preview" \
+  -H "X-Device-Key: YOUR_DEVICE_KEY"
 ```
 
 ## Important: Bypass Cloudflare Managed Challenge
@@ -407,7 +459,7 @@ The only thing you're disabling is the IP reputation challenge, which CF itself 
 ### Which Hostnames to Include
 
 | Domain | Why |
-|---|---|---|
+|---|---|
 | Worker domain | So the IP refresh page loads without challenge |
 | App direct-access domains | So Apps can connect (they can't complete challenges) |
 | **Don't include** browser-only admin domains | Keep challenge protection for those if you want |
@@ -427,7 +479,9 @@ The only thing you're disabling is the IP reputation challenge, which CF itself 
 ## Security Notes
 
 - Device keys are stored as Worker Secrets (never exposed to clients)
-- The `key` appears in the URL, so keep the link private even though the secret itself lives in Worker Secrets
+- Sync bookmarks still put `key` in the URL — keep that link private. Mutations (`add`/`remove`) use POST + header/body so the key is not required in query strings
+- CORS never reflects `*`; only same Worker origin is allowed when `Origin` is present
+- Authenticated requests are rate-limited (~30/min per device key + client IP)
 - Each device key maps to a unique device name in KV
 - IPs are stored with timestamps, oldest auto-evicted
 - The Worker only has permission to read/write the specific Access Policy
