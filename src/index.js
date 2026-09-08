@@ -40,7 +40,8 @@ export default {
         return htmlPage("Error", "<p>Unknown action</p>", 400);
       }
     } catch (e) {
-      return htmlPage("Error", `<p>${e.message}</p>`, 500);
+      console.error("Worker error:", e);
+      return htmlPage("Error", "<p>An unexpected error occurred</p>", 500);
     }
   },
 };
@@ -71,18 +72,41 @@ async function handleSync(request, device, key, env) {
   let cfResult = null;
 
   if (cfIp) {
-    cfResult = await addIpToDevice(device, cfIp, env);
+    const normalizedCfIp = normalizeAccessIp(cfIp);
+    if (normalizedCfIp) {
+      cfResult = await addIpToDevice(device, normalizedCfIp, env);
+    } else {
+      console.error("Skipping invalid CF-Connecting-IP:", cfIp);
+    }
   }
 
   const baseUrl = new URL(request.url).origin;
+  const safeCfIpDisplay = escapeHtml(cfIp || "unknown");
+  const safeBaseUrl = escapeJsString(baseUrl);
+  const safeKey = escapeJsString(key);
+  const safeCfIpJs = escapeJsString(cfIp || "");
+  const cfChanged = cfResult?.changed ? "true" : "false";
+
+  let cfBadgeClass = "ok";
+  let cfBadgeText = "Exists";
+  if (!cfIp) {
+    cfBadgeClass = "err";
+    cfBadgeText = "Missing";
+  } else if (!cfResult) {
+    cfBadgeClass = "err";
+    cfBadgeText = "Invalid";
+  } else if (cfResult.changed) {
+    cfBadgeClass = "added";
+    cfBadgeText = "Added";
+  }
 
   const body = `
     <div id="status">
       <h2>Updating whitelist...</h2>
       <div id="cf-ip" class="item">
         <span class="label">Connection IP:</span>
-        <span class="value">${cfIp || "unknown"}</span>
-        <span class="badge ${cfResult?.changed ? "added" : "ok"}">${cfResult?.changed ? "Added" : "Exists"}</span>
+        <span class="value">${safeCfIpDisplay}</span>
+        <span class="badge ${cfBadgeClass}">${cfBadgeText}</span>
       </div>
       <div id="ipv4" class="item">
         <span class="label">IPv4:</span>
@@ -98,9 +122,18 @@ async function handleSync(request, device, key, env) {
     <div id="summary"></div>
     <div id="entries"></div>
     <script>
-      const BASE = "${baseUrl}";
-      const KEY = "${key}";
-      const CF_IP = "${cfIp || ""}";
+      const BASE = "${safeBaseUrl}";
+      const KEY = "${safeKey}";
+      const CF_IP = "${safeCfIpJs}";
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
 
       async function probe(url, timeout) {
         const ctrl = new AbortController();
@@ -165,7 +198,7 @@ async function handleSync(request, device, key, env) {
           if (ld.success) {
             let html = '<h3>Current whitelist (' + ld.count + '/' + ld.max + ')</h3><ul>';
             for (const e of ld.entries) {
-              html += '<li>' + e.ip + ' <small>' + e.ago + '</small></li>';
+              html += '<li>' + escapeHtml(e.ip) + ' <small>' + escapeHtml(e.ago) + '</small></li>';
             }
             html += '</ul>';
             document.getElementById("entries").innerHTML = html;
@@ -173,7 +206,7 @@ async function handleSync(request, device, key, env) {
         } catch(e) {}
       }
 
-      function cfIpAdded() { return ${cfResult?.changed ? "true" : "false"}; }
+      function cfIpAdded() { return ${cfChanged}; }
 
       run();
     </script>`;
@@ -184,26 +217,38 @@ async function handleSync(request, device, key, env) {
 // ==================== Add / List / Remove ====================
 
 async function handleAdd(device, ip, env) {
-  const result = await addIpToDevice(device, ip, env);
+  const normalized = normalizeAccessIp(ip);
+  if (!normalized) {
+    return jsonResponse({ success: false, error: "Invalid IP address" }, 400);
+  }
+  const result = await addIpToDevice(device, normalized, env);
   return jsonResponse(result);
 }
 
 async function addIpToDevice(device, ip, env) {
+  const normalized = normalizeAccessIp(ip);
+  if (!normalized) {
+    return { success: false, error: "Invalid IP address" };
+  }
+
   const kvKey = "device:" + device;
   const raw = await env.DEVICE_IPS.get(kvKey, "json");
   let entries = Array.isArray(raw) ? raw : [];
 
-  const existing = entries.find((e) => e.ip === ip);
+  const existing = entries.find(
+    (e) => e.ip === normalized || normalizeAccessIp(e.ip) === normalized
+  );
   if (existing) {
     const now = Math.floor(Date.now() / 1000);
     const shouldSync = now - existing.ts >= EXISTING_IP_SYNC_INTERVAL_SECONDS;
     existing.ts = now;
+    existing.ip = normalized;
     await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
     if (shouldSync) await syncPolicy(env);
-    return { success: true, changed: false, ip, device, entries: entries.length, synced: shouldSync };
+    return { success: true, changed: false, ip: normalized, device, entries: entries.length, synced: shouldSync };
   }
 
-  entries.push({ ip, ts: Math.floor(Date.now() / 1000) });
+  entries.push({ ip: normalized, ts: Math.floor(Date.now() / 1000) });
 
   if (entries.length > MAX_IPS_PER_DEVICE) {
     entries.sort((a, b) => b.ts - a.ts);
@@ -214,7 +259,7 @@ async function addIpToDevice(device, ip, env) {
   await registerDevice(device, env);
   await syncPolicy(env);
 
-  return { success: true, changed: true, ip, device, entries: entries.length, max: MAX_IPS_PER_DEVICE };
+  return { success: true, changed: true, ip: normalized, device, entries: entries.length, max: MAX_IPS_PER_DEVICE };
 }
 
 async function handleList(device, env) {
@@ -236,11 +281,16 @@ async function handleList(device, env) {
 }
 
 async function handleRemove(device, ip, env) {
+  const normalized = normalizeAccessIp(ip);
   const kvKey = "device:" + device;
   const raw = await env.DEVICE_IPS.get(kvKey, "json");
   let entries = Array.isArray(raw) ? raw : [];
   const before = entries.length;
-  entries = entries.filter((e) => e.ip !== ip);
+  entries = entries.filter((e) => {
+    if (e.ip === ip) return false;
+    if (normalized && (e.ip === normalized || normalizeAccessIp(e.ip) === normalized)) return false;
+    return true;
+  });
 
   if (entries.length === before) {
     return jsonResponse({ success: false, error: "IP not found for " + device }, 404);
@@ -249,7 +299,13 @@ async function handleRemove(device, ip, env) {
   await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
   await syncPolicy(env);
 
-  return jsonResponse({ success: true, action: "removed", ip, device, remaining: entries.length });
+  return jsonResponse({
+    success: true,
+    action: "removed",
+    ip: normalized || ip,
+    device,
+    remaining: entries.length,
+  });
 }
 
 async function handlePreview(device, env) {
@@ -334,11 +390,11 @@ function normalizeAccessIp(value) {
     if (extra || !prefix) return null;
     if (isIPv4(addr)) {
       const n = Number(prefix);
-      return Number.isInteger(n) && n >= 0 && n <= 32 ? ip : null;
+      return Number.isInteger(n) && n >= 0 && n <= 32 ? `${addr}/${n}` : null;
     }
     if (isIPv6(addr)) {
       const n = Number(prefix);
-      return Number.isInteger(n) && n >= 0 && n <= 128 ? ip : null;
+      return Number.isInteger(n) && n >= 0 && n <= 128 ? `${addr}/${n}` : null;
     }
     return null;
   }
@@ -359,9 +415,76 @@ function isIPv4(value) {
   });
 }
 
+function isHexGroup(group) {
+  return /^[0-9a-fA-F]{1,4}$/.test(group);
+}
+
 function isIPv6(value) {
+  if (typeof value !== "string") return false;
   if (!value.includes(":")) return false;
-  return /^[0-9a-fA-F:.]+$/.test(value) && value.split(":").length >= 3;
+  if (/[^0-9a-fA-F:.]/.test(value)) return false;
+  if (value.includes(":::")) return false;
+
+  const doubleColons = value.match(/::/g);
+  if (doubleColons && doubleColons.length > 1) return false;
+
+  let head = value;
+  let v4Hextets = 0;
+
+  if (value.includes(".")) {
+    const lastColon = value.lastIndexOf(":");
+    if (lastColon < 0) return false;
+    const candidate = value.slice(lastColon + 1);
+    if (!candidate.includes(".")) return false;
+    if (!isIPv4(candidate)) return false;
+    v4Hextets = 2;
+    // Keep "::" intact when compression is adjacent to the IPv4 tail
+    // (e.g. "::192.0.2.1", "2001:db8::192.0.2.1"). Plain "::ffff:x.x.x.x"
+    // still uses the single-colon branch below.
+    if (lastColon > 0 && value[lastColon - 1] === ":") {
+      head = value.slice(0, lastColon + 1);
+    } else {
+      head = value.slice(0, lastColon);
+    }
+  }
+
+  if (value.includes("::")) {
+    const parts = head.split("::");
+    if (parts.length !== 2) return false;
+    const left = parts[0] === "" ? [] : parts[0].split(":");
+    const right = parts[1] === "" ? [] : parts[1].split(":");
+    if (left.some((g) => g === "") || right.some((g) => g === "")) return false;
+    if (![...left, ...right].every(isHexGroup)) return false;
+    const present = left.length + right.length + v4Hextets;
+    return present < 8;
+  }
+
+  const groups = head === "" ? [] : head.split(":");
+  if (groups.some((g) => g === "")) return false;
+  if (!groups.every(isHexGroup)) return false;
+  return groups.length + v4Hextets === 8;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function escapeJsString(value) {
+  return String(value)
+    .replace(/\\/g, "\\\\")
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e");
 }
 
 async function registerDevice(device, env) {
@@ -389,7 +512,8 @@ async function cfFetch(env, method, path, body) {
   );
   const data = await resp.json();
   if (!data.success) {
-    throw new Error("CF API: " + JSON.stringify(data.errors));
+    console.error("CF API error:", data.errors);
+    throw new Error("Cloudflare API request failed");
   }
   return data;
 }
@@ -415,7 +539,7 @@ function htmlPage(title, body, status = 200) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${title}</title>
+<title>${escapeHtml(title)}</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,system-ui,sans-serif;background:#1a1a2e;color:#eee;padding:20px;min-height:100vh}
