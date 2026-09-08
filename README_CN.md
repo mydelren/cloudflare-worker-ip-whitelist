@@ -261,16 +261,31 @@ if (isManual) {
 
 ## Cloudflare API Token
 
-在 https://dash.cloudflare.com/profile/api-tokens 创建自定义 Token：
+在 https://dash.cloudflare.com/profile/api-tokens 创建自定义 Token。
 
-| 权限 | 访问级别 |
-|---|---|
-| Account > Access: Apps and Policies | Edit |
-| Account > Workers Scripts | Edit |
-| Account > KV Storage | Edit |
-| Account > Account Settings | Read |
+### 运行时 Token（Worker 所需）
+
+Worker 运行时使用的 `CF_API_TOKEN` 密钥只需具备更新 Access Policy 的权限：
+
+| 权限 | 访问级别 | 用途 |
+|---|---|---|
+| Account > Access: Apps and Policies | Edit | GET/PUT Access Policy 的 include 列表 |
+| Account > Account Settings | Read | 按需解析账户级 Access API 调用 |
 
 作用域选择你的账户。
+
+**不要**给运行时 Token 授予 Workers Scripts Edit 或 KV Storage Edit。Worker 通过命名空间绑定访问 KV；脚本部署是另一回事。
+
+### 部署时权限（Dashboard / wrangler — 不是运行时 Token）
+
+创建 Worker、编辑代码、管理 KV 命名空间通过 Cloudflare Dashboard（或 `wrangler login` OAuth）完成，不依赖 `CF_API_TOKEN`。若使用 CI 部署 token 跑 wrangler，那是与 Worker 运行时密钥**分开**的凭证，可能需要：
+
+| 权限 | 访问级别 | 何时需要 |
+|---|---|---|
+| Account > Workers Scripts | Edit | 通过 API/CI 部署或更新 Worker |
+| Account > KV Storage | Edit | 通过 API/CI 创建或管理 KV 命名空间 |
+
+尽可能将运行时凭证与部署凭证分开。
 
 ## 高级配置
 
@@ -393,7 +408,7 @@ Cloudflare 官方文档明确说明：*"Cloudflare challenges are generally not 
 ### 需要加入的域名
 
 | 域名 | 原因 |
-|---|---|
+|---|---|---|
 | Worker 域名 | 确保 IP 刷新页面正常加载 |
 | App 直连域名 | 确保 App 请求能通过（App 无法完成验证） |
 | **不要加入** 仅浏览器访问的管理域名 | 可按需保留这些域名的验证保护 |

@@ -2,7 +2,7 @@
 // https://github.com/mydelren/cloudflare-worker-ip-whitelist
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
     if (request.method === "OPTIONS") {
@@ -23,17 +23,17 @@ export default {
 
     try {
       if (action === "sync") {
-        return await handleSync(request, device, key, env);
+        return await handleSync(request, device, key, env, ctx);
       } else if (action === "add") {
         const ip = url.searchParams.get("ip");
         if (!ip) return jsonResponse({ success: false, error: "Missing ip parameter" }, 400);
-        return await handleAdd(device, ip, env);
+        return await handleAdd(device, ip, env, ctx);
       } else if (action === "list") {
         return await handleList(device, env);
       } else if (action === "remove") {
         const ip = url.searchParams.get("ip");
         if (!ip) return jsonResponse({ success: false, error: "Missing ip parameter" }, 400);
-        return await handleRemove(device, ip, env);
+        return await handleRemove(device, ip, env, ctx);
       } else if (action === "preview") {
         return await handlePreview(device, env);
       } else {
@@ -49,6 +49,17 @@ export default {
 const MAX_IPS_PER_DEVICE = 8;
 const DEVICE_KEYS_MAP_KEY = "meta:device_keys";
 const EXISTING_IP_SYNC_INTERVAL_SECONDS = 300;
+
+// Policy sync coalesce + single-flight (P1)
+const POLICY_SYNC_LOCK_KEY = "meta:policy_sync_lock";
+const POLICY_SYNC_DIRTY_KEY = "meta:policy_sync_dirty";
+const POLICY_SYNC_LOCK_TTL_SECONDS = 15;
+const POLICY_SYNC_DEBOUNCE_MS = 2500;
+const POLICY_SYNC_MAX_FLUSH_ROUNDS = 3;
+const POLICY_SYNC_LOCK_RETRY_MS = 200;
+
+/** @type {{ dirty: boolean, inFlight: Promise<void> | null }} */
+const syncCoalesce = { dirty: false, inFlight: null };
 
 // ==================== Device Key Validation ====================
 
@@ -67,7 +78,7 @@ function validateKey(key, env) {
 
 // ==================== Sync (HTML page) ====================
 
-async function handleSync(request, device, key, env) {
+async function handleSync(request, device, key, env, ctx) {
   const cfIp = request.headers.get("CF-Connecting-IP");
   let cfResult = null;
 
@@ -79,6 +90,10 @@ async function handleSync(request, device, key, env) {
       console.error("Skipping invalid CF-Connecting-IP:", cfIp);
     }
   }
+
+  // Return HTML quickly; flush policy sync in the background so the page's
+  // sequential client-side add(v4)/add(v6) can land in KV during debounce.
+  enqueueFlush(ctx, env);
 
   const baseUrl = new URL(request.url).origin;
   const safeCfIpDisplay = escapeHtml(cfIp || "unknown");
@@ -216,12 +231,13 @@ async function handleSync(request, device, key, env) {
 
 // ==================== Add / List / Remove ====================
 
-async function handleAdd(device, ip, env) {
+async function handleAdd(device, ip, env, ctx) {
   const normalized = normalizeAccessIp(ip);
   if (!normalized) {
     return jsonResponse({ success: false, error: "Invalid IP address" }, 400);
   }
   const result = await addIpToDevice(device, normalized, env);
+  await flushSync(env, ctx);
   return jsonResponse(result);
 }
 
@@ -244,7 +260,7 @@ async function addIpToDevice(device, ip, env) {
     existing.ts = now;
     existing.ip = normalized;
     await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
-    if (shouldSync) await syncPolicy(env);
+    if (shouldSync) scheduleSync();
     return { success: true, changed: false, ip: normalized, device, entries: entries.length, synced: shouldSync };
   }
 
@@ -257,7 +273,7 @@ async function addIpToDevice(device, ip, env) {
 
   await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
   await registerDevice(device, env);
-  await syncPolicy(env);
+  scheduleSync();
 
   return { success: true, changed: true, ip: normalized, device, entries: entries.length, max: MAX_IPS_PER_DEVICE };
 }
@@ -280,7 +296,7 @@ async function handleList(device, env) {
   });
 }
 
-async function handleRemove(device, ip, env) {
+async function handleRemove(device, ip, env, ctx) {
   const normalized = normalizeAccessIp(ip);
   const kvKey = "device:" + device;
   const raw = await env.DEVICE_IPS.get(kvKey, "json");
@@ -297,7 +313,8 @@ async function handleRemove(device, ip, env) {
   }
 
   await env.DEVICE_IPS.put(kvKey, JSON.stringify(entries));
-  await syncPolicy(env);
+  scheduleSync();
+  await flushSync(env, ctx);
 
   return jsonResponse({
     success: true,
@@ -337,7 +354,83 @@ function getFixedEntries(env) {
     .map((ip) => ({ ip: { ip } }));
 }
 
-async function syncPolicy(env) {
+/** Mark that an Access Policy PUT is needed (in-memory coalesce per isolate). */
+function scheduleSync() {
+  syncCoalesce.dirty = true;
+}
+
+function enqueueFlush(ctx, env) {
+  if (!syncCoalesce.dirty && !syncCoalesce.inFlight) return;
+  const p = flushSync(env, null);
+  if (ctx && typeof ctx.waitUntil === "function") {
+    ctx.waitUntil(p);
+  }
+  return p;
+}
+
+/**
+ * Flush coalesced sync work once. Prefer awaiting from mutate handlers;
+ * sync page uses waitUntil so HTML returns while debounce absorbs client adds.
+ */
+async function flushSync(env, ctx) {
+  if (syncCoalesce.inFlight) {
+    // Piggy-back on in-flight flush; ensure a follow-up if more dirt arrives.
+    syncCoalesce.dirty = true;
+    await syncCoalesce.inFlight;
+    if (syncCoalesce.dirty) return flushSync(env, ctx);
+    return;
+  }
+  if (!syncCoalesce.dirty) return;
+
+  syncCoalesce.dirty = false;
+  const p = runSyncWithLock(env);
+  syncCoalesce.inFlight = p;
+  try {
+    await p;
+  } finally {
+    if (syncCoalesce.inFlight === p) syncCoalesce.inFlight = null;
+  }
+  if (syncCoalesce.dirty) {
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(flushSync(env, null));
+      return;
+    }
+    return flushSync(env, null);
+  }
+}
+
+async function runSyncWithLock(env) {
+  await markPolicySyncDirty(env);
+
+  const owner = await acquirePolicySyncLock(env);
+  if (!owner) {
+    // Another isolate holds the lock; dirty flag is set for the leader to re-flush.
+    console.warn("Policy sync lock busy; left dirty flag for lock holder");
+    return;
+  }
+
+  try {
+    // Short debounce so rapid sequential HTTP adds (sync page v4+v6) share one PUT.
+    await sleep(POLICY_SYNC_DEBOUNCE_MS);
+
+    for (let round = 0; round < POLICY_SYNC_MAX_FLUSH_ROUNDS; round++) {
+      await clearPolicySyncDirty(env);
+      // Always rebuild include from current KV (+ FIXED_IPS) at PUT time.
+      await syncPolicyOnce(env);
+      if (!(await isPolicySyncDirty(env))) break;
+      await sleep(150);
+    }
+  } finally {
+    await releasePolicySyncLock(env, owner);
+  }
+
+  // Waiter may have marked dirty after our last check but before release.
+  if (await isPolicySyncDirty(env)) {
+    await runSyncWithLock(env);
+  }
+}
+
+async function syncPolicyOnce(env) {
   const include = await buildPolicyInclude(env);
   const policy = await cfFetch(env, "GET", `/access/policies/${env.POLICY_ID}`);
   const result = policy.result;
@@ -348,6 +441,64 @@ async function syncPolicy(env) {
   delete nextPolicy.updated_at;
 
   await cfFetch(env, "PUT", `/access/policies/${env.POLICY_ID}`, nextPolicy);
+}
+
+async function markPolicySyncDirty(env) {
+  await env.DEVICE_IPS.put(POLICY_SYNC_DIRTY_KEY, String(Date.now()), {
+    expirationTtl: 60,
+  });
+}
+
+async function clearPolicySyncDirty(env) {
+  await env.DEVICE_IPS.delete(POLICY_SYNC_DIRTY_KEY);
+}
+
+async function isPolicySyncDirty(env) {
+  const v = await env.DEVICE_IPS.get(POLICY_SYNC_DIRTY_KEY);
+  return v != null;
+}
+
+async function acquirePolicySyncLock(env) {
+  // Prefer deferring to an existing lock holder (dirty flag) over stampedes.
+  // A couple of quick retries cover stale/expired lease races.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const owner = await tryAcquirePolicySyncLock(env);
+    if (owner) return owner;
+    await sleep(POLICY_SYNC_LOCK_RETRY_MS);
+  }
+  return null;
+}
+
+async function tryAcquirePolicySyncLock(env) {
+  const now = Date.now();
+  const current = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
+  if (current && typeof current.expiresAt === "number" && current.expiresAt > now) {
+    return null;
+  }
+
+  const owner = crypto.randomUUID();
+  const expiresAt = now + POLICY_SYNC_LOCK_TTL_SECONDS * 1000;
+  await env.DEVICE_IPS.put(
+    POLICY_SYNC_LOCK_KEY,
+    JSON.stringify({ owner, expiresAt }),
+    { expirationTtl: POLICY_SYNC_LOCK_TTL_SECONDS + 5 }
+  );
+
+  // Best-effort verify (KV has no compare-and-swap).
+  const verify = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
+  if (verify && verify.owner === owner) return owner;
+  return null;
+}
+
+async function releasePolicySyncLock(env, owner) {
+  const current = await env.DEVICE_IPS.get(POLICY_SYNC_LOCK_KEY, "json");
+  if (current && current.owner === owner) {
+    await env.DEVICE_IPS.delete(POLICY_SYNC_LOCK_KEY);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function buildPolicyInclude(env) {

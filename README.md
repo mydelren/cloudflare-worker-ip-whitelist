@@ -260,16 +260,31 @@ if (isManual) {
 
 ## Cloudflare API Token
 
-Create a Custom Token at https://dash.cloudflare.com/profile/api-tokens:
+Create a Custom Token at https://dash.cloudflare.com/profile/api-tokens.
 
-| Permission | Access |
-|---|---|
-| Account > Access: Apps and Policies | Edit |
-| Account > Workers Scripts | Edit |
-| Account > KV Storage | Edit |
-| Account > Account Settings | Read |
+### Runtime token (required for the Worker)
+
+The `CF_API_TOKEN` secret used by the Worker at runtime only needs permission to update the Access Policy:
+
+| Permission | Access | Why |
+|---|---|---|
+| Account > Access: Apps and Policies | Edit | GET/PUT the Access Policy include list |
+| Account > Account Settings | Read | Resolve account-scoped Access API calls as needed |
 
 Scope: Include your account.
+
+Do **not** grant Workers Scripts Edit or KV Storage Edit on the runtime token. The Worker already has KV access via its namespace binding; script deploys are separate.
+
+### Deploy-time permissions (Dashboard / wrangler — not the runtime token)
+
+Creating the Worker, editing code, and managing KV namespaces is done through the Cloudflare Dashboard (or `wrangler login` OAuth), not through `CF_API_TOKEN`. If you use a CI deploy token for wrangler, that is a **separate** token from the Worker's runtime secret and may need:
+
+| Permission | Access | When |
+|---|---|---|
+| Account > Workers Scripts | Edit | Deploying/updating the Worker via API/CI |
+| Account > KV Storage | Edit | Creating/managing KV namespaces via API/CI |
+
+Keep runtime and deploy credentials separate whenever possible.
 
 ## Customization
 
@@ -392,7 +407,7 @@ The only thing you're disabling is the IP reputation challenge, which CF itself 
 ### Which Hostnames to Include
 
 | Domain | Why |
-|---|---|
+|---|---|---|
 | Worker domain | So the IP refresh page loads without challenge |
 | App direct-access domains | So Apps can connect (they can't complete challenges) |
 | **Don't include** browser-only admin domains | Keep challenge protection for those if you want |
